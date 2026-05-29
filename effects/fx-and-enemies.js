@@ -44,6 +44,9 @@
   var THREE = window.THREE;
   var R = GAME.refs;
   var clamp = function (v, lo, hi) { return Math.max(lo, Math.min(hi, v)); };
+  // [3号機] 低スペック最適化（1号機公開）：particleScale でパーティクル数を間引き、lowSpec で本数を落とす
+  var LOW = !!GAME.lowSpec;
+  function pScale() { return (GAME.perf && GAME.perf.particleScale) || 1; }
 
   // ════════════════════════════════════════════════════════════
   //  共有：煙パーティクル（爆発の煙・ミサイル排煙で共有）
@@ -82,8 +85,8 @@
     var color = (d.color != null) ? d.color : 0xffaa33;
     var up = pos.clone().normalize();                             // 地球中心→外向き（破片の擬似重力）
 
-    // 破片（金属片）
-    var nF = clamp(Math.round(size * 3), 2, 14);
+    // 破片（金属片）※ particleScale で間引き
+    var nF = clamp(Math.round(size * 3 * pScale()), LOW ? 1 : 2, 14);
     var fragments = [];
     for (var i = 0; i < nF; i++) {
       var f = new THREE.Mesh(fragGeo, fragMat);
@@ -98,8 +101,8 @@
       });
     }
 
-    // 煙（共有システムへ）
-    var nS = clamp(Math.round(size * 1.5), 1, 6);
+    // 煙（共有システムへ）※ particleScale で間引き（lowSpec では 0 もあり得る）
+    var nS = clamp(Math.round(size * 1.5 * pScale()), LOW ? 0 : 1, 6);
     for (var j = 0; j < nS; j++) {
       var sp = pos.clone().add(new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(0.1 * size));
       spawnSmokePuff(sp, 0.06 * size, 0x333333);
@@ -226,7 +229,7 @@
       m.mesh.lookAt(m.mesh.position.clone().add(m.dir));
       // 排煙トレイル
       m.trailT -= dt;
-      if (m.trailT <= 0) { spawnSmokePuff(m.mesh.position.clone(), 0.025, 0x888888); m.trailT = 0.045; }
+      if (m.trailT <= 0) { spawnSmokePuff(m.mesh.position.clone(), 0.025, 0x888888); m.trailT = LOW ? 0.09 : 0.045; }
       // プレイヤー命中
       if (m.mesh.position.distanceTo(player) < 0.4) {
         R.damage(15);
@@ -349,12 +352,17 @@
     }
     if (moved > 0) console.log('[3号機] 海上の戦車を陸地へ移設:', moved + '台');
   }
-  var landBindDone = false;
-  function tryBindTanks() {
+  // ★ isLand は canvas ピクセル読みで重いので毎フレーム呼ばない。準備チェックは0.5秒間隔・
+  //    実拘束は配置時 *一度だけ*（landBindDone）。以後 isLand は一切呼ばない。
+  var landBindDone = false, landPollT = 0;
+  function tryBindTanks(dt) {
     if (landBindDone) return;
+    landPollT -= dt;
+    if (landPollT > 0) return;
+    landPollT = 0.5;
     if (GAME.isLand(0, -150)) return;   // 既知の海(太平洋中部)が陸=true の間はマスク未準備
     landBindDone = true;
-    bindTanksToLand();
+    bindTanksToLand();                  // この中の isLand 探索は一度きり
   }
 
   // ════════════════════════════════════════════════════════════
@@ -378,7 +386,8 @@
   function mkCloud() {
     var g = new THREE.Group();
     var puffMat = new THREE.MeshPhongMaterial({ color: 0x2a2f3a, emissive: 0x05070c, transparent: true, opacity: 0.85, flatShading: true });
-    for (var i = 0; i < 7; i++) {
+    var puffN = LOW ? 4 : 7;                       // lowSpec はパフ数を削減
+    for (var i = 0; i < puffN; i++) {
       var s = new THREE.Mesh(new THREE.SphereGeometry(0.5 + Math.random() * 0.5, 8, 6), puffMat);
       s.position.set((Math.random() - 0.5) * 2.2, (Math.random() - 0.5) * 0.7, (Math.random() - 0.5) * 2.2);
       s.scale.y = 0.6;
@@ -391,7 +400,8 @@
     return g;
   }
   function initClouds() {
-    for (var i = 0; i < 4; i++) {                // 低〜中空に4カ所（固定ワールド座標）
+    var cloudN = LOW ? 2 : 4;                     // lowSpec は雲の数を削減
+    for (var i = 0; i < cloudN; i++) {           // 低〜中空に配置（固定ワールド座標）
       var c = mkCloud();
       var dir = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
       c.position.copy(dir.multiplyScalar(ER + 0.6 + Math.random() * 2.0));
@@ -437,7 +447,7 @@
   var auroras = [];
   function mkAurora(poleSign) {
     // 極軸まわりの開いた円筒をカーテンに見立て、頂点カラーで緑(下)→紫(上)、加算半透明
-    var geo = new THREE.CylinderGeometry(2.6, 2.6, 2.4, 40, 6, true);
+    var geo = new THREE.CylinderGeometry(2.6, 2.6, 2.4, LOW ? 20 : 40, LOW ? 3 : 6, true); // lowSpec はセグメント削減
     var pos = geo.attributes.position, colors = [];
     for (var i = 0; i < pos.count; i++) {
       var t = (pos.getY(i) + 1.2) / 2.4;         // 0(下)→1(上)
@@ -456,15 +466,17 @@
     for (var k = 0; k < auroras.length; k++) {
       var a = auroras[k];
       a.mesh.rotation.y += dt * 0.08;
-      // 波打ち：半径方向に sin で揺らす
-      var p = a.mesh.geometry.attributes.position, base = a.base;
-      for (var i = 0; i < p.count; i++) {
-        var bx = base[i * 3], by = base[i * 3 + 1], bz = base[i * 3 + 2];
-        var ang = Math.atan2(bz, bx);
-        var w = 1 + 0.12 * Math.sin(ang * 5 + envT * 1.5 + by);
-        p.setX(i, bx * w); p.setZ(i, bz * w);
+      // 波打ち：半径方向に sin で揺らす（lowSpec では毎フレーム頂点更新を省略＝静的カーテン）
+      if (!LOW) {
+        var p = a.mesh.geometry.attributes.position, base = a.base;
+        for (var i = 0; i < p.count; i++) {
+          var bx = base[i * 3], by = base[i * 3 + 1], bz = base[i * 3 + 2];
+          var ang = Math.atan2(bz, bx);
+          var w = 1 + 0.12 * Math.sin(ang * 5 + envT * 1.5 + by);
+          p.setX(i, bx * w); p.setZ(i, bz * w);
+        }
+        p.needsUpdate = true;
       }
-      p.needsUpdate = true;
       // 極に近いほど濃く（極地を飛ぶと見える）
       var poleY = a.sign * (ER + 1.8);
       var distToPole = Math.abs(player.y - poleY) + Math.hypot(player.x, player.z) * 0.5;
@@ -495,9 +507,10 @@
   function updateMeteors(dt) {
     var playerAlt = R.playerGroup.position.length() - ER;
     meteorTimer -= dt;
-    if (playerAlt > 2 && meteorTimer <= 0 && meteors.length < 6) {   // 高高度/宇宙寄りでのみ
+    var meteorMax = LOW ? 3 : 6;                                      // lowSpec は同時数を削減
+    if (playerAlt > 2 && meteorTimer <= 0 && meteors.length < meteorMax) {   // 高高度/宇宙寄りでのみ
       spawnMeteor();
-      meteorTimer = 0.4 + Math.random() * 1.2;
+      meteorTimer = (LOW ? 0.8 : 0.4) + Math.random() * 1.2;          // lowSpec は発生間隔を広げる
     }
     for (var i = meteors.length - 1; i >= 0; i--) {
       var m = meteors[i];
@@ -535,7 +548,7 @@
   //  毎フレーム集約（1本の onUpdate に集約）
   // ════════════════════════════════════════════════════════════
   GAME.onUpdate(function (dt) {
-    tryBindTanks();        // ① 戦車の陸地拘束（マスク準備後に一度だけ実行）
+    tryBindTanks(dt);      // ① 戦車の陸地拘束（0.5秒間隔チェック→配置時一度だけ）
     updateFighterAI(dt);   // 内蔵戦闘機AIの後に位置を上書き（②③修正）
     updateMissiles(dt);    // 新敵：誘導ミサイル
     updateSmoke(dt);       // 煙
