@@ -1989,7 +1989,13 @@ function update(dt){
     const fbAxis = rightDir.clone().negate();
     const dF = fb * speed;
     const qF = new THREE.Quaternion().setFromAxisAngle(fbAxis, dF);
+    const prevQuat = posQuat.clone();
     posQuat.premultiply(qF);
+    // ★ 極点クランプ：緯度±85°超で基底が退化し「極で抜けられない」ため、
+    //   極へ近づく移動だけ取り消す（離れる移動は許可＝既に極にいても脱出できる）
+    const prevY = Math.abs(new THREE.Vector3(0,1,0).applyQuaternion(prevQuat).y);
+    const newY  = Math.abs(new THREE.Vector3(0,1,0).applyQuaternion(posQuat).y);
+    if(newY > 0.9962 && newY > prevY) posQuat.copy(prevQuat);
   }
   pAlt += ud * altSpd;
   pAlt = Math.max(0.05, Math.min(80, pAlt));
