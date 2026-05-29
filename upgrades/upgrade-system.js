@@ -104,11 +104,18 @@
 
   // ── アンロック表示（label のみ。閾値は CONFIG.unlock） ──────
   var TIERS = [
-    { key:'rapid',  label:'⚡ 連射2倍' },
-    { key:'shield', label:'🛡 シールド+50' },
-    { key:'spread', label:'﹅ 散弾3方向' },
-    { key:'pierce', label:'🔆 レーザー貫通' },
-    { key:'mega',   label:'💥 メガビーム' },
+    { key:'rapid',  icon:'⚡', short:'連射', label:'⚡ 連射2倍' },
+    { key:'shield', icon:'🛡', short:'盾',   label:'🛡 シールド+50' },
+    { key:'spread', icon:'﹅', short:'散弾', label:'﹅ 散弾3方向' },
+    { key:'pierce', icon:'🔆', short:'貫通', label:'🔆 レーザー貫通' },
+    { key:'mega',   icon:'💥', short:'メガ', label:'💥 メガビーム' },
+  ];
+  // 可視化UI用：時限バフの定義（残量ゲージ。dur は CONFIG のキー）
+  var BUFFS = [
+    { key:'invinc',     icon:'★',  color:'#ffdd55', dur:'invincDuration',     name:'無敵' },
+    { key:'score2x',    icon:'×2', color:'#ffd54a', dur:'score2xDuration',    name:'2倍' },
+    { key:'overcharge', icon:'▣',  color:'#ffcc22', dur:'overchargeDuration', name:'弾薬' },
+    { key:'speed',      icon:'»',  color:'#66ff99', dur:'speedDuration',      name:'速度' },
   ];
 
   // ── ドロップアイテム定義（③：色・形・効果） ────────────────
@@ -139,32 +146,113 @@
   var hud = null, flashEl = null, flashTime = 0;
 
   // ════════════════════════════════════════════════════════════════════
-  //  HUD ＋ 全画面フラッシュ（②メガビーム演出）
+  //  強化段階の可視化UI（DOM動的生成・index.html無改変）＋ 全画面フラッシュ
+  //  配置：画面左端の中段（上部のミッション/SCORE/ボスHP・下隅のモバイル操作を回避）
   // ════════════════════════════════════════════════════════════════════
+  var ui = {};
+  function el(tag, css, parent){ var e = document.createElement(tag); if (css) e.style.cssText = css; if (parent) parent.appendChild(e); return e; }
+  function makeBar(parent, color){
+    var outer = el('div', 'width:96px;height:6px;background:rgba(255,255,255,.12);border-radius:3px;overflow:hidden;margin-top:1px', parent);
+    var fill  = el('div', 'height:100%;width:0%;background:' + color + ';transition:width .12s', outer);
+    return { outer:outer, fill:fill };
+  }
   function buildDom(){
-    hud = document.createElement('div');
-    hud.style.cssText = 'position:fixed;left:10px;bottom:150px;z-index:11;'
-      + 'font-family:monospace;font-size:11px;line-height:1.5;color:#cfe9ff;'
-      + 'text-shadow:0 0 6px #000;pointer-events:none;white-space:nowrap';
-    document.body.appendChild(hud);
-    flashEl = document.createElement('div');
-    flashEl.style.cssText = 'position:fixed;inset:0;z-index:9;pointer-events:none;'
-      + 'background:radial-gradient(circle,#fff 0%,#ff66ff 60%,transparent 100%);opacity:0';
-    document.body.appendChild(flashEl);
+    var panel = el('div',
+      'position:fixed;left:8px;top:46%;transform:translateY(-50%);z-index:11;pointer-events:none;'
+      + 'font-family:monospace;color:#cfe9ff;text-shadow:0 0 5px #000;'
+      + 'background:rgba(6,14,28,.42);border:1px solid rgba(120,180,255,.25);border-radius:6px;'
+      + 'padding:6px 8px;min-width:118px;line-height:1.35', document.body);
+    ui.panel = panel;
+    // 1) アンロック済み一覧（アイコンチップ：点灯/暗いグレー）
+    var chips = el('div', 'display:flex;gap:4px;margin-bottom:4px', panel);
+    ui.chips = {};
+    TIERS.forEach(function(t){
+      ui.chips[t.key] = el('span',
+        'font-size:13px;width:18px;height:18px;display:flex;align-items:center;justify-content:center;'
+        + 'border-radius:4px;background:rgba(255,255,255,.06)', chips);
+      ui.chips[t.key].textContent = t.icon;
+      ui.chips[t.key].title = t.label;
+    });
+    // 2) 次アンロックまでの進捗
+    ui.nextText = el('div', 'font-size:9px;letter-spacing:.5px;opacity:.92', panel);
+    ui.nextBar  = makeBar(panel, 'linear-gradient(90deg,#3af,#9cf)');
+    // 4) シールド残量（shield 解放時のみ表示）
+    ui.shieldWrap  = el('div', 'margin-top:5px;display:none', panel);
+    ui.shieldLabel = el('div', 'font-size:9px', ui.shieldWrap);
+    ui.shieldBar   = makeBar(ui.shieldWrap, '#3388ff');
+    // 3) 時限バフの残りゲージ（発動中のみ表示）
+    ui.buffWrap = el('div', 'margin-top:5px', panel);
+    ui.buffs = {};
+    BUFFS.forEach(function(b){
+      var row = el('div', 'display:none;align-items:center;gap:4px;margin-top:2px', ui.buffWrap);
+      var lab = el('span', 'font-size:10px;width:16px;text-align:center;color:' + b.color, row);
+      lab.textContent = b.icon;
+      var bar = makeBar(row, b.color);
+      ui.buffs[b.key] = { row:row, bar:bar };
+    });
+    // メガビーム蓄積ゲージ（mega 解放時のみ）
+    ui.megaRow  = el('div', 'display:none;align-items:center;gap:4px;margin-top:2px', ui.buffWrap);
+    var ml = el('span', 'font-size:10px;width:16px;text-align:center;color:#ff66ff', ui.megaRow);
+    ml.textContent = '💥';
+    ui.megaBar = makeBar(ui.megaRow, '#ff66ff');
+    ui.megaTxt = el('span', 'font-size:8px;color:#ff9cf0', ui.megaRow);
+    // preset 表示
+    ui.preset = el('div', 'font-size:8px;opacity:.6;margin-top:5px', panel);
+
+    flashEl = el('div', 'position:fixed;inset:0;z-index:9;pointer-events:none;'
+      + 'background:radial-gradient(circle,#fff 0%,#ff66ff 60%,transparent 100%);opacity:0', document.body);
+    refreshHud();
   }
   function refreshHud(){
-    if (!hud) return;
-    var lines = [];
-    var un = TIERS.filter(function(t){ return S[t.key]; }).map(function(t){ return t.label; });
-    if (un.length) lines.push('強化: ' + un.join(' / '));
-    if (S.shield)         lines.push('🛡 シールド ' + Math.ceil(S.shieldHp) + '/' + S.shieldMax);
-    if (S.overcharge > 0) lines.push('▣ 弾薬チャージ ' + S.overcharge.toFixed(1) + 's');
-    if (S.invinc > 0)     lines.push('★ 無敵 ' + S.invinc.toFixed(1) + 's');
-    if (S.score2x > 0)    lines.push('×2 スコア2倍 ' + S.score2x.toFixed(1) + 's');
-    if (S.speed > 0)      lines.push('» スピードUP ' + S.speed.toFixed(1) + 's');
-    if (S.mega) lines.push('💥 メガビーム ' + (S.megaCharge >= CONFIG.megaCooldown ? 'READY' : Math.ceil(CONFIG.megaCooldown - S.megaCharge) + 's'));
-    lines.push('〔preset: ' + CONFIG.preset + '〕');
-    hud.innerHTML = lines.join('<br>');
+    if (!ui.panel) return;
+    // 1) チップ点灯/グレー
+    TIERS.forEach(function(t){
+      var c = ui.chips[t.key];
+      if (S[t.key]){ c.style.opacity = '1'; c.style.filter = 'none'; c.style.background = 'rgba(90,160,255,.30)'; }
+      else { c.style.opacity = '.32'; c.style.filter = 'grayscale(1)'; c.style.background = 'rgba(255,255,255,.04)'; }
+    });
+    // 2) 次アンロックまでの進捗
+    var score = GAME.refs.score | 0, U = CONFIG.unlock, prev = 0, nextT = null;
+    for (var i = 0; i < TIERS.length; i++){
+      var th = U[TIERS[i].key];
+      if (S[TIERS[i].key]) prev = th;
+      else { nextT = TIERS[i]; break; }
+    }
+    if (nextT){
+      var goal = U[nextT.key], remain = Math.max(0, goal - score);
+      var ratio = goal > prev ? Math.max(0, Math.min(1, (score - prev) / (goal - prev))) : 0;
+      ui.nextText.innerHTML = '次: ' + nextT.short + ' あと <b>' + remain.toLocaleString() + '</b>pt';
+      ui.nextBar.outer.style.display = '';
+      ui.nextBar.fill.style.width = (ratio * 100).toFixed(1) + '%';
+    } else {
+      ui.nextText.innerHTML = '強化 <b>MAX</b> 🏆';
+      ui.nextBar.outer.style.display = 'none';
+    }
+    // 4) シールド残量
+    if (S.shield){
+      ui.shieldWrap.style.display = '';
+      var r = S.shieldMax ? S.shieldHp / S.shieldMax : 0;
+      ui.shieldLabel.textContent = '🛡 ' + Math.ceil(S.shieldHp) + '/' + S.shieldMax;
+      ui.shieldBar.fill.style.width = (r * 100).toFixed(0) + '%';
+      ui.shieldBar.fill.style.background = r > 0.5 ? '#3388ff' : r > 0.25 ? '#ffaa00' : '#ff3322';
+    } else ui.shieldWrap.style.display = 'none';
+    // 3) 時限バフ残り
+    BUFFS.forEach(function(b){
+      var rem = S[b.key] || 0, row = ui.buffs[b.key];
+      if (rem > 0){
+        row.row.style.display = 'flex';
+        var max = CONFIG[b.dur] || 1;
+        row.bar.fill.style.width = Math.max(0, Math.min(1, rem / max) * 100).toFixed(0) + '%';
+      } else row.row.style.display = 'none';
+    });
+    // メガビーム蓄積
+    if (S.mega){
+      ui.megaRow.style.display = 'flex';
+      var ready = S.megaCharge >= CONFIG.megaCooldown;
+      ui.megaBar.fill.style.width = Math.min(100, S.megaCharge / CONFIG.megaCooldown * 100).toFixed(0) + '%';
+      ui.megaTxt.textContent = ready ? 'READY' : Math.ceil(CONFIG.megaCooldown - S.megaCharge) + 's';
+    } else ui.megaRow.style.display = 'none';
+    ui.preset.textContent = 'preset: ' + CONFIG.preset;
   }
   function warn(msg){ try { GAME.refs.showWarn(msg); } catch(e){} }
   function triggerFlash(){ flashTime = 0.32; }
@@ -519,7 +607,7 @@
   window.UFOUpgrades = {
     setPreset: function(name){ applyPreset(name); refreshHud(); warn('⚙ preset: ' + CONFIG.preset); return CONFIG.preset; },
     getConfig: function(){ return CONFIG; },
-    _state:S, _items:items, _deco:deco, onFire:onFire, onDamage:onDamage, update:update,
+    _state:S, _items:items, _deco:deco, _ui:ui, onFire:onFire, onDamage:onDamage, update:update,
   };
   console.log('[UFOUpgrades] 2号機 UFO強化＆ドロップアイテム 接続完了（preset=' + CONFIG.preset + '）');
 })();
