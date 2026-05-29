@@ -1141,9 +1141,8 @@ function playerFire(){
                   .add(tempEast.clone().multiplyScalar(Math.sin(camYaw)));
   }
 
-  const b = new THREE.Mesh(bulletGeo, playerBulletMat);
+  const b = acquirePBullet(bulletGeo, playerBulletMat);
   b.position.copy(p);
-  scene.add(b);
   bullets.push({mesh: b, vel: bulletDir.multiplyScalar(2.5), life: 3, dmg: 1});
 }
 
@@ -1464,13 +1463,36 @@ function getAimDir(){
 // ── ビーム砲（強力・貫通的に高ダメージ） ──
 const _beamGeo = new THREE.CylinderGeometry(0.02, 0.02, 0.5, 8);
 const _beamMat = new THREE.MeshBasicMaterial({color:0x66ffff});
+
+// ── プレイヤー弾オブジェクトプール（phase2・GC churn 抑制）──
+// 戦闘中は new も scene.remove もしない：プールから取り出して visible=true、
+// 死亡時は visible=false でプールに戻すだけ。弾種ごとに geometry/material を差し替えて共有。
+const _pBulletPool = [];
+function acquirePBullet(geo, mat){
+  let m = _pBulletPool.pop();
+  if(!m){ m = new THREE.Mesh(geo, mat); scene.add(m); }
+  else { m.geometry = geo; m.material = mat; }
+  m.visible = true;
+  m.scale.set(1, 1, 1);
+  m.quaternion.identity();
+  return m;
+}
+function releasePBullet(m){
+  m.visible = false;
+  _pBulletPool.push(m);
+}
+// 起動時に上限数だけ事前生成（非表示でプール）→戦闘中の生成ゼロ
+for(let _i = 0; _i < MAX_BULLETS; _i++){
+  const _m = new THREE.Mesh(bulletGeo, playerBulletMat);
+  _m.visible = false; scene.add(_m); _pBulletPool.push(_m);
+}
+
 function fireBeam(){
   const p = playerGroup.position;
   const dir = getAimDir();
-  const b = new THREE.Mesh(_beamGeo, _beamMat);
+  const b = acquirePBullet(_beamGeo, _beamMat);
   b.position.copy(p);
   b.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir);
-  scene.add(b);
   bullets.push({mesh:b, vel:dir.clone().multiplyScalar(3.4), life:2.2, dmg:5});
 }
 
@@ -1481,9 +1503,8 @@ function fireMulti(){
   const axis = p.clone().normalize();
   for(let k = -1; k <= 1; k++){
     const dir = base.clone().applyAxisAngle(axis, k * 0.22);
-    const b = new THREE.Mesh(bulletGeo, playerBulletMat);
+    const b = acquirePBullet(bulletGeo, playerBulletMat);
     b.position.copy(p);
-    scene.add(b);
     bullets.push({mesh:b, vel:dir.multiplyScalar(2.5), life:3, dmg:1});
   }
 }
@@ -1766,7 +1787,7 @@ function updateSuperEnemies(dt){
       const b = bullets[j];
       if(b.mesh.position.distanceTo(se.mesh.position) < se.radius){
         se.hp -= b.dmg;
-        scene.remove(b.mesh); bullets.splice(j,1);
+        releasePBullet(b.mesh); bullets.splice(j,1);
         if(se.hp <= 0){
           const big = (se.type === 'boss' || se.type === 'battleship');
           const col = se.type === 'boss' ? 0x66ccff : se.type === 'battleship' ? 0xffcc66 : 0xffaa33;
@@ -2098,7 +2119,7 @@ function update(dt){
     b.mesh.position.add(b.vel.clone().multiplyScalar(dt * 60));
     b.life -= dt;
     if(b.life <= 0){
-      scene.remove(b.mesh);
+      releasePBullet(b.mesh);
       bullets.splice(i, 1);
       continue;
     }
@@ -2116,7 +2137,7 @@ function update(dt){
           enemies.splice(j, 1);
           addScore(100);
         }
-        scene.remove(b.mesh);
+        releasePBullet(b.mesh);
         bullets.splice(i, 1);
         hit = true;
         break;
@@ -2139,7 +2160,7 @@ function update(dt){
         } else {
           explode(b.mesh.position.clone(), 1, 0xffaa00);
         }
-        scene.remove(b.mesh);
+        releasePBullet(b.mesh);
         bullets.splice(i, 1);
         hit = true;
         break;
@@ -2155,7 +2176,7 @@ function update(dt){
           // ピラミッドは破壊不可
           explode(b.mesh.position.clone(), 0.8, 0xffaa00);
           showWarn('🏛 神聖な遺跡には傷ひとつ付かない！');
-          scene.remove(b.mesh);
+          releasePBullet(b.mesh);
           bullets.splice(i, 1);
           break;
         }
@@ -2173,7 +2194,7 @@ function update(dt){
         } else {
           explode(b.mesh.position.clone(), 0.8, 0xffaa00);
         }
-        scene.remove(b.mesh);
+        releasePBullet(b.mesh);
         bullets.splice(i, 1);
         break;
       }
