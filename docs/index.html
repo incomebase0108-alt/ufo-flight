@@ -2172,6 +2172,8 @@ function update(dt){
 // ── メインループ ────────────────────────
 let lastT = 0;
 let frameCount = 0;
+// 地表構造物を地球と同じだけ自転させるための1フレーム分の回転（Y軸・earthMeshと同値）
+const _earthSpin = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), 0.0001);
 function loop(t){
   requestAnimationFrame(loop);
   const dt = Math.min((t-lastT)/1000, 0.05);
@@ -2179,6 +2181,12 @@ function loop(t){
 
   earthMesh.rotation.y += 0.0001;
   if(cloudMesh) cloudMesh.rotation.y += 0.00015;
+
+  // ★ 地表の構造物（基地・戦艦・戦車・ピラミッド等）を地球と同じだけ自転させる。
+  //   ※ earthMesh の子にすると mesh.position がローカル化して衝突/ロックオン/敵AI（全てワールド座標前提）が壊れるため、
+  //     ワールド座標を保ったまま Y軸まわりに同角度だけ回す方式（位置＋向きを premultiply）。
+  for(let i = 0; i < bases.length; i++){ bases[i].mesh.position.applyQuaternion(_earthSpin); bases[i].mesh.quaternion.premultiply(_earthSpin); }
+  for(let i = 0; i < groundUnits.length; i++){ groundUnits[i].mesh.position.applyQuaternion(_earthSpin); groundUnits[i].mesh.quaternion.premultiply(_earthSpin); }
 
   update(dt);
   renderer.render(scene, camera);
