@@ -498,6 +498,7 @@ GAME.refs = {
   explode(pos, size, color){ explode(pos, size, color); },
   showWarn(msg){ showWarn(msg); },
   aimDir(){ return getAimDir(); },
+  get superEnemies(){ return superEnemies; }, // ボス/メカ配列（3号機のロボ陸地拘束等）
 };
 
 // 発射拡張フック（2号機の武器強化用）：ハンドラが true を返すと既定の発射をスキップ
@@ -1987,5 +1988,7 @@ if(navigator.geolocation){
 }
 </script>
 <script>/*__UPGRADE_SYSTEM__*/</script>
+<script>/*__FX_ENEMIES__*/</script>
+<script>/*__LANDMARKS__*/</script>
 </body>
 </html>

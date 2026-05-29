@@ -39,7 +39,9 @@ else:
 # 各機の追記モジュール（別ファイル）を単一HTMLにインライン埋め込み
 #   placeholder（index.html内）-> ファイルパス
 INLINE_MODULES = {
-    "/*__UPGRADE_SYSTEM__*/": os.path.join(ROOT, "upgrades", "upgrade-system.js"),  # 2号機
+    "/*__UPGRADE_SYSTEM__*/": os.path.join(ROOT, "upgrades", "upgrade-system.js"),    # 2号機
+    "/*__FX_ENEMIES__*/":     os.path.join(ROOT, "effects", "fx-and-enemies.js"),     # 3号機
+    "/*__LANDMARKS__*/":      os.path.join(ROOT, "landmarks", "landmarks.js"),        # 4号機
 }
 for mk, path in INLINE_MODULES.items():
     if mk in html and os.path.isfile(path):

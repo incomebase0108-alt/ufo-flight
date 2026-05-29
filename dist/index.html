@@ -830,6 +830,7 @@ GAME.refs = {
   explode(pos, size, color){ explode(pos, size, color); },
   showWarn(msg){ showWarn(msg); },
   aimDir(){ return getAimDir(); },
+  get superEnemies(){ return superEnemies; }, // ボス/メカ配列（3号機のロボ陸地拘束等）
 };
 
 // 発射拡張フック（2号機の武器強化用）：ハンドラが true を返すと既定の発射をスキップ
@@ -2378,11 +2379,19 @@ if(navigator.geolocation){
     megaBeams: 24, megaDamage: 6, megaCooldown: 15, megaBeamLife: 2.0, megaSpeed: 3.2, megaBeamRadius: 0.05,
     // ドロップ（敵種別の出現率／種類の重み）
     dropChance:  { fighter:0.22, mecha:0.5, ship:0.6, tank:0.28, base:0.85, boss:1.0 },
-    dropWeights: { heal:40, ammo:30, invinc:15, score2x:8, bomb:7 },
+    dropWeights: { heal:36, ammo:26, invinc:13, score2x:8, bomb:7, speed:10 },
     maxItems: 6, itemLife: 18, pickupRadius: 0.6,
     // アイテム効果
     healAmount: 30, overchargeDuration: 8, invincDuration: 6, score2xDuration: 12,
-    bombBeams: 28, bombDamage: 5,   // 全画面ボム（即時の放射斉射）
+    bombBeams: 28, bombDamage: 5,           // 全画面ボム（即時の放射斉射）
+    speedMul: 1.6, speedDuration: 8,        // スピードアップ（1号機 GAME.setSpeedMultiplier 連携）
+    // ② 効果減衰：時限バフは被弾1ヒットで -buffHitPenalty 秒（永続アンロックは対象外）
+    buffHitPenalty: 2,
+    // ① 自機装飾（GAME.refs.playerGroup へ重ねる装飾レイヤー）
+    deco: {
+      ringColor:0x66ccff, shieldColor:0x3388ff, podColor:0xff66cc, emitterColor:0x66ffff, auraColor:0xff66ff,
+      ringRadius:0.30, shieldRadius:0.42, podOffset:0.26, podSize:0.07, emitterFwd:0.30, auraRadius:0.60, megaScale:1.18,
+    },
   };
   var PRESETS = {
     easy: {
@@ -2416,11 +2425,18 @@ if(navigator.geolocation){
 
   // ── アンロック表示（label のみ。閾値は CONFIG.unlock） ──────
   var TIERS = [
-    { key:'rapid',  label:'⚡ 連射2倍' },
-    { key:'shield', label:'🛡 シールド+50' },
-    { key:'spread', label:'﹅ 散弾3方向' },
-    { key:'pierce', label:'🔆 レーザー貫通' },
-    { key:'mega',   label:'💥 メガビーム' },
+    { key:'rapid',  icon:'⚡', short:'連射', label:'⚡ 連射2倍' },
+    { key:'shield', icon:'🛡', short:'盾',   label:'🛡 シールド+50' },
+    { key:'spread', icon:'﹅', short:'散弾', label:'﹅ 散弾3方向' },
+    { key:'pierce', icon:'🔆', short:'貫通', label:'🔆 レーザー貫通' },
+    { key:'mega',   icon:'💥', short:'メガ', label:'💥 メガビーム' },
+  ];
+  // 可視化UI用：時限バフの定義（残量ゲージ。dur は CONFIG のキー）
+  var BUFFS = [
+    { key:'invinc',     icon:'★',  color:'#ffdd55', dur:'invincDuration',     name:'無敵' },
+    { key:'score2x',    icon:'×2', color:'#ffd54a', dur:'score2xDuration',    name:'2倍' },
+    { key:'overcharge', icon:'▣',  color:'#ffcc22', dur:'overchargeDuration', name:'弾薬' },
+    { key:'speed',      icon:'»',  color:'#66ff99', dur:'speedDuration',      name:'速度' },
   ];
 
   // ── ドロップアイテム定義（③：色・形・効果） ────────────────
@@ -2430,17 +2446,20 @@ if(navigator.geolocation){
     invinc:  { color:0x9fe8ff, icon:'★', label:'一時無敵',     shape:'rainbow' },
     score2x: { color:0xffd54a, icon:'×2', label:'スコア2倍',   shape:'star' },
     bomb:    { color:0xff5522, icon:'✸', label:'全画面ボム',   shape:'spike' },
+    speed:   { color:0x66ff99, icon:'»', label:'スピードアップ', shape:'arrow' },
   };
 
   // ── 内部状態 ───────────────────────────────────────────────
   var S = {
     rapid:false, shield:false, spread:false, pierce:false, mega:false,
     shieldMax:CONFIG.shieldMax, shieldHp:0, sinceHit:99,
-    overcharge:0, invinc:0, score2x:0,
-    megaCharge:0,
+    overcharge:0, invinc:0, score2x:0, speed:0,   // 時限バフ残り秒
+    megaCharge:0, _speedApplied:1,
     // score2x（外部増分のみ2倍にする・フィードバックループ防止）
     _lastExternal:null, _bonusTotal:0,
   };
+  // ① 自機装飾レイヤー
+  var deco = { group:null, mount:null, ring:null, shield:null, pods:false, emitter:null, aura:null, invincShell:null, shieldFlash:0 };
   var items = [];     // ドロップ中アイテム
   var trails = [];    // ②トレイルの残像（上限管理）
   var TRAIL_CAP = 70;
@@ -2448,31 +2467,113 @@ if(navigator.geolocation){
   var hud = null, flashEl = null, flashTime = 0;
 
   // ════════════════════════════════════════════════════════════════════
-  //  HUD ＋ 全画面フラッシュ（②メガビーム演出）
+  //  強化段階の可視化UI（DOM動的生成・index.html無改変）＋ 全画面フラッシュ
+  //  配置：画面左端の中段（上部のミッション/SCORE/ボスHP・下隅のモバイル操作を回避）
   // ════════════════════════════════════════════════════════════════════
+  var ui = {};
+  function el(tag, css, parent){ var e = document.createElement(tag); if (css) e.style.cssText = css; if (parent) parent.appendChild(e); return e; }
+  function makeBar(parent, color){
+    var outer = el('div', 'width:96px;height:6px;background:rgba(255,255,255,.12);border-radius:3px;overflow:hidden;margin-top:1px', parent);
+    var fill  = el('div', 'height:100%;width:0%;background:' + color + ';transition:width .12s', outer);
+    return { outer:outer, fill:fill };
+  }
   function buildDom(){
-    hud = document.createElement('div');
-    hud.style.cssText = 'position:fixed;left:10px;bottom:150px;z-index:11;'
-      + 'font-family:monospace;font-size:11px;line-height:1.5;color:#cfe9ff;'
-      + 'text-shadow:0 0 6px #000;pointer-events:none;white-space:nowrap';
-    document.body.appendChild(hud);
-    flashEl = document.createElement('div');
-    flashEl.style.cssText = 'position:fixed;inset:0;z-index:9;pointer-events:none;'
-      + 'background:radial-gradient(circle,#fff 0%,#ff66ff 60%,transparent 100%);opacity:0';
-    document.body.appendChild(flashEl);
+    var panel = el('div',
+      'position:fixed;left:8px;top:46%;transform:translateY(-50%);z-index:11;pointer-events:none;'
+      + 'font-family:monospace;color:#cfe9ff;text-shadow:0 0 5px #000;'
+      + 'background:rgba(6,14,28,.42);border:1px solid rgba(120,180,255,.25);border-radius:6px;'
+      + 'padding:6px 8px;min-width:118px;line-height:1.35', document.body);
+    ui.panel = panel;
+    // 1) アンロック済み一覧（アイコンチップ：点灯/暗いグレー）
+    var chips = el('div', 'display:flex;gap:4px;margin-bottom:4px', panel);
+    ui.chips = {};
+    TIERS.forEach(function(t){
+      ui.chips[t.key] = el('span',
+        'font-size:13px;width:18px;height:18px;display:flex;align-items:center;justify-content:center;'
+        + 'border-radius:4px;background:rgba(255,255,255,.06)', chips);
+      ui.chips[t.key].textContent = t.icon;
+      ui.chips[t.key].title = t.label;
+    });
+    // 2) 次アンロックまでの進捗
+    ui.nextText = el('div', 'font-size:9px;letter-spacing:.5px;opacity:.92', panel);
+    ui.nextBar  = makeBar(panel, 'linear-gradient(90deg,#3af,#9cf)');
+    // 4) シールド残量（shield 解放時のみ表示）
+    ui.shieldWrap  = el('div', 'margin-top:5px;display:none', panel);
+    ui.shieldLabel = el('div', 'font-size:9px', ui.shieldWrap);
+    ui.shieldBar   = makeBar(ui.shieldWrap, '#3388ff');
+    // 3) 時限バフの残りゲージ（発動中のみ表示）
+    ui.buffWrap = el('div', 'margin-top:5px', panel);
+    ui.buffs = {};
+    BUFFS.forEach(function(b){
+      var row = el('div', 'display:none;align-items:center;gap:4px;margin-top:2px', ui.buffWrap);
+      var lab = el('span', 'font-size:10px;width:16px;text-align:center;color:' + b.color, row);
+      lab.textContent = b.icon;
+      var bar = makeBar(row, b.color);
+      ui.buffs[b.key] = { row:row, bar:bar };
+    });
+    // メガビーム蓄積ゲージ（mega 解放時のみ）
+    ui.megaRow  = el('div', 'display:none;align-items:center;gap:4px;margin-top:2px', ui.buffWrap);
+    var ml = el('span', 'font-size:10px;width:16px;text-align:center;color:#ff66ff', ui.megaRow);
+    ml.textContent = '💥';
+    ui.megaBar = makeBar(ui.megaRow, '#ff66ff');
+    ui.megaTxt = el('span', 'font-size:8px;color:#ff9cf0', ui.megaRow);
+    // preset 表示
+    ui.preset = el('div', 'font-size:8px;opacity:.6;margin-top:5px', panel);
+
+    flashEl = el('div', 'position:fixed;inset:0;z-index:9;pointer-events:none;'
+      + 'background:radial-gradient(circle,#fff 0%,#ff66ff 60%,transparent 100%);opacity:0', document.body);
+    refreshHud();
   }
   function refreshHud(){
-    if (!hud) return;
-    var lines = [];
-    var un = TIERS.filter(function(t){ return S[t.key]; }).map(function(t){ return t.label; });
-    if (un.length) lines.push('強化: ' + un.join(' / '));
-    if (S.shield)         lines.push('🛡 シールド ' + Math.ceil(S.shieldHp) + '/' + S.shieldMax);
-    if (S.overcharge > 0) lines.push('▣ 弾薬チャージ ' + S.overcharge.toFixed(1) + 's');
-    if (S.invinc > 0)     lines.push('★ 無敵 ' + S.invinc.toFixed(1) + 's');
-    if (S.score2x > 0)    lines.push('×2 スコア2倍 ' + S.score2x.toFixed(1) + 's');
-    if (S.mega) lines.push('💥 メガビーム ' + (S.megaCharge >= CONFIG.megaCooldown ? 'READY' : Math.ceil(CONFIG.megaCooldown - S.megaCharge) + 's'));
-    lines.push('〔preset: ' + CONFIG.preset + '〕');
-    hud.innerHTML = lines.join('<br>');
+    if (!ui.panel) return;
+    // 1) チップ点灯/グレー
+    TIERS.forEach(function(t){
+      var c = ui.chips[t.key];
+      if (S[t.key]){ c.style.opacity = '1'; c.style.filter = 'none'; c.style.background = 'rgba(90,160,255,.30)'; }
+      else { c.style.opacity = '.32'; c.style.filter = 'grayscale(1)'; c.style.background = 'rgba(255,255,255,.04)'; }
+    });
+    // 2) 次アンロックまでの進捗
+    var score = GAME.refs.score | 0, U = CONFIG.unlock, prev = 0, nextT = null;
+    for (var i = 0; i < TIERS.length; i++){
+      var th = U[TIERS[i].key];
+      if (S[TIERS[i].key]) prev = th;
+      else { nextT = TIERS[i]; break; }
+    }
+    if (nextT){
+      var goal = U[nextT.key], remain = Math.max(0, goal - score);
+      var ratio = goal > prev ? Math.max(0, Math.min(1, (score - prev) / (goal - prev))) : 0;
+      ui.nextText.innerHTML = '次: ' + nextT.short + ' あと <b>' + remain.toLocaleString() + '</b>pt';
+      ui.nextBar.outer.style.display = '';
+      ui.nextBar.fill.style.width = (ratio * 100).toFixed(1) + '%';
+    } else {
+      ui.nextText.innerHTML = '強化 <b>MAX</b> 🏆';
+      ui.nextBar.outer.style.display = 'none';
+    }
+    // 4) シールド残量
+    if (S.shield){
+      ui.shieldWrap.style.display = '';
+      var r = S.shieldMax ? S.shieldHp / S.shieldMax : 0;
+      ui.shieldLabel.textContent = '🛡 ' + Math.ceil(S.shieldHp) + '/' + S.shieldMax;
+      ui.shieldBar.fill.style.width = (r * 100).toFixed(0) + '%';
+      ui.shieldBar.fill.style.background = r > 0.5 ? '#3388ff' : r > 0.25 ? '#ffaa00' : '#ff3322';
+    } else ui.shieldWrap.style.display = 'none';
+    // 3) 時限バフ残り
+    BUFFS.forEach(function(b){
+      var rem = S[b.key] || 0, row = ui.buffs[b.key];
+      if (rem > 0){
+        row.row.style.display = 'flex';
+        var max = CONFIG[b.dur] || 1;
+        row.bar.fill.style.width = Math.max(0, Math.min(1, rem / max) * 100).toFixed(0) + '%';
+      } else row.row.style.display = 'none';
+    });
+    // メガビーム蓄積
+    if (S.mega){
+      ui.megaRow.style.display = 'flex';
+      var ready = S.megaCharge >= CONFIG.megaCooldown;
+      ui.megaBar.fill.style.width = Math.min(100, S.megaCharge / CONFIG.megaCooldown * 100).toFixed(0) + '%';
+      ui.megaTxt.textContent = ready ? 'READY' : Math.ceil(CONFIG.megaCooldown - S.megaCharge) + 's';
+    } else ui.megaRow.style.display = 'none';
+    ui.preset.textContent = 'preset: ' + CONFIG.preset;
   }
   function warn(msg){ try { GAME.refs.showWarn(msg); } catch(e){} }
   function triggerFlash(){ flashTime = 0.32; }
@@ -2543,11 +2644,19 @@ if(navigator.geolocation){
   }
 
   // ════════════════════════════════════════════════════════════════════
-  //  被ダメージ修飾（GAME.onDamage）：無敵→シールド→残りHP
+  //  被ダメージ修飾（GAME.onDamage）：② 時限バフ減衰 → 無敵 → シールド → 残りHP
   // ════════════════════════════════════════════════════════════════════
   function onDamage(n){
     S.sinceHit = 0;
-    if (S.invinc > 0) return 0;
+    var wasInvinc = S.invinc > 0;
+    // ② 時限バフは被弾ごと短縮（永続アンロック rapid/spread/pierce/mega は対象外＝買い切り）
+    var pen = CONFIG.buffHitPenalty;
+    if (S.invinc > 0)     S.invinc     = Math.max(0, S.invinc - pen);
+    if (S.score2x > 0)    S.score2x    = Math.max(0, S.score2x - pen);
+    if (S.overcharge > 0) S.overcharge = Math.max(0, S.overcharge - pen);
+    if (S.speed > 0)      S.speed      = Math.max(0, S.speed - pen);
+    deco.shieldFlash = 0.25;                 // ① 被弾フラッシュ
+    if (wasInvinc) return 0;                 // 被弾時に無敵だった → このヒットはカット
     if (S.shield && S.shieldHp > 0){
       if (S.shieldHp >= n){ S.shieldHp -= n; refreshHud(); return 0; }
       var rem = n - S.shieldHp; S.shieldHp = 0; refreshHud(); return rem;
@@ -2616,6 +2725,7 @@ if(navigator.geolocation){
     if (shape === 'box')    return new T.Mesh(new T.BoxGeometry(0.12, 0.12, 0.12), m);            // 弾薬
     if (shape === 'star')   return new T.Mesh(new T.TorusKnotGeometry(0.06, 0.022, 48, 6), m);    // スコア2倍
     if (shape === 'spike')  return new T.Mesh(new T.OctahedronGeometry(0.1, 0), m);               // ボム
+    if (shape === 'arrow')  return new T.Mesh(new T.ConeGeometry(0.07, 0.16, 12), m);             // スピードアップ
     return new T.Mesh(new T.IcosahedronGeometry(0.09, 0), m);                                     // 無敵ほか
   }
   function spawnDrop(pos, chance){
@@ -2638,9 +2748,83 @@ if(navigator.geolocation){
     else if (key === 'invinc') S.invinc = CONFIG.invincDuration;
     else if (key === 'score2x'){ S.score2x = CONFIG.score2xDuration; }
     else if (key === 'bomb')   bombDischarge();
+    else if (key === 'speed')  S.speed = CONFIG.speedDuration;   // 1号機 setSpeedMultiplier は update で適用
     warn(DROPS[key].icon + ' ' + DROPS[key].label);
     GAME.emit('itemGet', { type:key });   // ★ 4号機 sfx.item() 発火（③配線）
     refreshHud();
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  ① 自機の見た目強化：装飾レイヤーを playerGroup（or GAME.playerMesh）へ重ねる
+  //     core（UFOメッシュ生成）は無改変。アンロック段階で add、毎フレーム同期。
+  // ════════════════════════════════════════════════════════════════════
+  var _dA = {};   // 装飾アセット（lazy）
+  function decoAssets(){
+    var D = CONFIG.deco;
+    _dA.ring     = _dA.ring     || new T.Mesh(new T.TorusGeometry(D.ringRadius, 0.018, 8, 24), new T.MeshBasicMaterial({ color:D.ringColor }));
+    _dA.shieldMt = _dA.shieldMt || new T.MeshBasicMaterial({ color:D.shieldColor, transparent:true, opacity:0.25 });
+    _dA.auraMt   = _dA.auraMt   || new T.MeshBasicMaterial({ color:D.auraColor, transparent:true, opacity:0.18 });
+    return _dA;
+  }
+  function ensureMount(){
+    if (deco.group) return true;
+    var pm = (typeof GAME.playerMesh !== 'undefined' && GAME.playerMesh) ? GAME.playerMesh : GAME.refs.playerGroup;
+    if (!pm || typeof pm.add !== 'function') return false;
+    deco.group = new T.Group();
+    deco.mount = pm;
+    pm.add(deco.group);
+    return true;
+  }
+  function syncDeco(dt){
+    if (!ensureMount()) return;
+    var D = CONFIG.deco;
+    // ⚡ 連射2倍：発光リング高速回転
+    if (S.rapid){
+      if (!deco.ring){ decoAssets(); deco.ring = _dA.ring; deco.ring.rotation.x = Math.PI/2; deco.group.add(deco.ring); }
+      deco.ring.rotation.z += (S.overcharge > 0 ? 0.45 : 0.28);
+    }
+    // 🛡 シールド：半透明シールド球（残量で色/透明度、被弾でフラッシュ）
+    if (S.shield){
+      if (!deco.shield){ decoAssets(); deco.shield = new T.Mesh(new T.SphereGeometry(D.shieldRadius, 16, 12), _dA.shieldMt.clone()); deco.group.add(deco.shield); }
+      var r = S.shieldMax ? (S.shieldHp / S.shieldMax) : 0;        // 満タン=1
+      deco.shield.material.color.setHSL(0.6 * r, 1, 0.5);          // 濃青(0.6)→赤(0)
+      var op = 0.10 + 0.28 * r;
+      if (deco.shieldFlash > 0){ deco.shieldFlash = Math.max(0, deco.shieldFlash - dt); op = 0.55; }
+      deco.shield.material.opacity = op;
+      deco.shield.visible = S.shieldHp > 0.5 || deco.shieldFlash > 0;
+    }
+    // ﹅ 散弾：サイドポッド2基
+    if (S.spread && !deco.pods){
+      decoAssets();
+      var pm2 = new T.MeshBasicMaterial({ color:D.podColor });
+      for (var s = -1; s <= 1; s += 2){
+        var pod = new T.Mesh(new T.SphereGeometry(D.podSize, 10, 8), pm2);
+        pod.position.set(s * D.podOffset, 0, 0);
+        deco.group.add(pod);
+      }
+      deco.pods = true;
+    }
+    // 🔆 レーザー貫通：機首発光エミッター
+    if (S.pierce && !deco.emitter){
+      deco.emitter = new T.Mesh(new T.SphereGeometry(0.05, 10, 8), new T.MeshBasicMaterial({ color:D.emitterColor }));
+      deco.emitter.position.set(0, 0, -D.emitterFwd);   // 機首方向（-Z 前方想定）
+      deco.group.add(deco.emitter);
+      deco.group.add(new T.PointLight(D.emitterColor, 0.8, 1.0));
+    }
+    // 💥 メガビーム：オーラ＋装飾拡大＋色変化（最終形態感）。core scale は触らない
+    if (S.mega){
+      if (!deco.aura){ decoAssets(); deco.aura = new T.Mesh(new T.SphereGeometry(D.auraRadius, 16, 12), _dA.auraMt.clone()); deco.group.add(deco.aura); }
+      deco.auraHue = ((deco.auraHue || 0) + dt * 0.4) % 1;
+      deco.aura.material.color.setHSL(deco.auraHue, 1, 0.6);
+      deco.aura.rotation.y += 0.01;
+      deco.group.scale.setScalar(D.megaScale);
+    }
+    // ★ 一時無敵：金色シェル（時限。切れたら消えて見た目が戻る＝②）
+    if (S.invinc > 0){
+      if (!deco.invincShell){ deco.invincShell = new T.Mesh(new T.SphereGeometry(D.shieldRadius * 1.1, 14, 10), new T.MeshBasicMaterial({ color:0xffdd55, transparent:true, opacity:0.22 })); deco.group.add(deco.invincShell); }
+      deco.invincShell.visible = true;
+      deco.invincShell.rotation.y += 0.08;
+    } else if (deco.invincShell){ deco.invincShell.visible = false; }
   }
 
   // ── ②トレイル：貫通/メガ弾の残像を生成・減衰 ───────────────
@@ -2673,7 +2857,14 @@ if(navigator.geolocation){
     if (S.overcharge > 0) S.overcharge = Math.max(0, S.overcharge - dt);
     if (S.invinc > 0)     S.invinc     = Math.max(0, S.invinc - dt);
     if (S.score2x > 0)    S.score2x    = Math.max(0, S.score2x - dt);
+    if (S.speed > 0)      S.speed      = Math.max(0, S.speed - dt);
     S.sinceHit += dt;
+
+    // スピードアップ：1号機 GAME.setSpeedMultiplier に倍率を反映（変化時のみ）
+    var wantMul = S.speed > 0 ? CONFIG.speedMul : 1;
+    if (wantMul !== S._speedApplied && typeof GAME.setSpeedMultiplier === 'function'){
+      GAME.setSpeedMultiplier(wantMul); S._speedApplied = wantMul;
+    }
 
     // スコア2倍：外部増分だけを追い足し（自分の加点はループしないよう除外）
     var cur = GAME.refs.score | 0;
@@ -2696,6 +2887,7 @@ if(navigator.geolocation){
     if (flashTime > 0 && flashEl){ flashTime = Math.max(0, flashTime - dt); flashEl.style.opacity = (flashTime / 0.32 * 0.6).toFixed(3); }
 
     updateTrails(dt);
+    syncDeco(dt);   // ① 自機装飾レイヤーを状態に同期
 
     // ドロップアイテム：アニメ・寿命・取得
     var pg = GAME.refs.playerGroup, scene = GAME.refs.scene;
@@ -2736,9 +2928,748 @@ if(navigator.geolocation){
   window.UFOUpgrades = {
     setPreset: function(name){ applyPreset(name); refreshHud(); warn('⚙ preset: ' + CONFIG.preset); return CONFIG.preset; },
     getConfig: function(){ return CONFIG; },
-    _state:S, _items:items, onFire:onFire, onDamage:onDamage, update:update,
+    _state:S, _items:items, _deco:deco, _ui:ui, onFire:onFire, onDamage:onDamage, update:update,
   };
   console.log('[UFOUpgrades] 2号機 UFO強化＆ドロップアイテム 接続完了（preset=' + CONFIG.preset + '）');
+})();
+</script>
+<script>/* ════════════════════════════════════════════════════════════════════════
+ *  fx-and-enemies.js  —  3号機担当：演出強化 ＆ 新敵「誘導ミサイル」＆ 戦闘機AI修正
+ * ════════════════════════════════════════════════════════════════════════
+ *
+ *  UFO地球侵略ゲームに以下を追加するモジュール。1号機が用意した統合土台
+ *  （window.GAME のイベントバス＋onUpdate フック＋GAME.refs）に *乗せるだけ* で
+ *  動きます。既存コードは無改変（1号機の設計方針「触らず末尾に追記」に準拠）。
+ *  ※ モデル読込（GLTFLoader.load 等）は一切しません。GLB は1号機が embed.py で
+ *     埋込済・mk* 差替済のため、二重ロードを避けここでは触れません。
+ *
+ *  ── 1号機向け 統合手順 ──────────────────────────────────────────────
+ *  ① このファイル全体を index.html の *末尾の追記モジュール領域* に貼り付ける
+ *     （4号機 audio / 2号機 upgrade-system と同じ。GAME 定義より後ろならどこでも可）。
+ *     これだけで完了（index.html ロジックの改変は不要）。
+ *  ② embed.py で単一HTML化する場合は audio と同様にマーカー方式でも可
+ *     （例：placeholder `/*__FX_3GOKI__*\/` を1つ足して replace）。お任せします。
+ *
+ *  使用する GAME API（すべて 1号機実装済み）:
+ *    GAME.onUpdate(fn)        毎フレーム fn(dt)。※update()末尾＝updateCamera/内蔵敵AIの
+ *                             *後*・render の *前* に走るので、カメラ揺らし・敵AI上書きが可能。
+ *    GAME.on(name, fn)        イベント購読
+ *    GAME.refs.{scene,camera,playerGroup,enemies,bases,bullets,eBullets,
+ *               playerHP,addScore,damage,showWarn}
+ *    購読イベント: 'playerHit' {n} … 画面シェイク / 'explosion' {pos,size,color} … 演出上乗せ
+ *
+ *  ── 実装機能 ─────────────────────────────────────────────────────────
+ *  【新敵：誘導ミサイル】プレイヤーを追尾。旋回レート制限で回避可能。プレイヤー弾で
+ *     迎撃可（+120pt）。命中で被弾(15)＋爆発。基地から発射（基地全滅時は周囲低空）。
+ *  【爆発強化】既存 explode の 'explosion' イベントに乗せて 破片・煙・衝撃波・発光コア を
+ *     “上乗せ”（既存の火球＋PointLight は据え置き）。サイズでスケール（小爆発は軽量）。
+ *  【画面シェイク】被弾('playerHit')でカメラを一時的に揺らす（ダメージ量に比例・減衰）。
+ *  【戦闘機AI修正 ②③（hoshi実機FB）】内蔵AIの「目標到達で停止／自機停止で敵停止」を解消。
+ *     onUpdate が内蔵AIの後に走る性質を使い、毎フレーム敵位置を上書き：
+ *       ・常に最低速度で動き続ける（プレイヤー速度に非依存）
+ *       ・遠い=接近 / 近い=プレイヤー周囲を旋回 の2モード切替
+ *  ※ ①「戦車/ロボが海に出る」は陸地判定が必要で配置側(1号機)と要相談のため本モジュール未対応。
+ * ════════════════════════════════════════════════════════════════════════ */
+(function () {
+  'use strict';
+  if (!window.GAME || !window.THREE) {
+    console.warn('[3号機] GAME / THREE 未定義のため FX/新敵モジュールをスキップ');
+    return;
+  }
+  var THREE = window.THREE;
+  var R = GAME.refs;
+  var clamp = function (v, lo, hi) { return Math.max(lo, Math.min(hi, v)); };
+
+  // ════════════════════════════════════════════════════════════
+  //  共有：煙パーティクル（爆発の煙・ミサイル排煙で共有）
+  // ════════════════════════════════════════════════════════════
+  var smokePuffs = [];
+  function spawnSmokePuff(pos, size, color) {
+    var s = new THREE.Mesh(
+      new THREE.SphereGeometry(size, 6, 6),
+      new THREE.MeshBasicMaterial({ color: color, transparent: true, opacity: 0.55, depthWrite: false })
+    );
+    s.position.copy(pos);
+    R.scene.add(s);
+    smokePuffs.push({ mesh: s, life: 0.6 + Math.random() * 0.3, grow: 1.2 + Math.random() * 1.5 });
+  }
+  function updateSmoke(dt) {
+    for (var i = smokePuffs.length - 1; i >= 0; i--) {
+      var s = smokePuffs[i];
+      s.life -= dt;
+      s.mesh.scale.multiplyScalar(1 + s.grow * dt);
+      s.mesh.material.opacity = Math.max(0, s.life * 0.7);
+      if (s.life <= 0) { R.scene.remove(s.mesh); smokePuffs.splice(i, 1); }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  爆発強化：'explosion' イベントに破片・衝撃波・発光コアを上乗せ
+  // ════════════════════════════════════════════════════════════
+  var fxList = [];
+  var fragGeo = new THREE.TetrahedronGeometry(1);                 // スケールで都度サイズ調整
+  var fragMat = new THREE.MeshPhongMaterial({ color: 0x9099a4, emissive: 0x221100, shininess: 80 });
+
+  GAME.on('explosion', function (d) {
+    if (!d || !d.pos) return;
+    var pos = d.pos.clone ? d.pos.clone() : new THREE.Vector3(d.pos.x, d.pos.y, d.pos.z);
+    var size = d.size || 1;
+    var color = (d.color != null) ? d.color : 0xffaa33;
+    var up = pos.clone().normalize();                             // 地球中心→外向き（破片の擬似重力）
+
+    // 破片（金属片）
+    var nF = clamp(Math.round(size * 3), 2, 14);
+    var fragments = [];
+    for (var i = 0; i < nF; i++) {
+      var f = new THREE.Mesh(fragGeo, fragMat);
+      f.scale.setScalar(0.025 * size);
+      f.position.copy(pos);
+      R.scene.add(f);
+      fragments.push({
+        mesh: f,
+        vel: new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
+          .normalize().multiplyScalar((0.2 + Math.random() * 0.3) * size),
+        spin: new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(0.4)
+      });
+    }
+
+    // 煙（共有システムへ）
+    var nS = clamp(Math.round(size * 1.5), 1, 6);
+    for (var j = 0; j < nS; j++) {
+      var sp = pos.clone().add(new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(0.1 * size));
+      spawnSmokePuff(sp, 0.06 * size, 0x333333);
+    }
+
+    // 発光コア（白く膨らみフェード）
+    var core = new THREE.Mesh(
+      new THREE.SphereGeometry(0.08 * size, 12, 8),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false })
+    );
+    core.position.copy(pos); R.scene.add(core);
+
+    // 衝撃波（膨張する半透明シェル）
+    var shock = new THREE.Mesh(
+      new THREE.SphereGeometry(0.1 * size, 16, 12),
+      new THREE.MeshBasicMaterial({ color: color, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide })
+    );
+    shock.position.copy(pos); R.scene.add(shock);
+
+    fxList.push({ fragments: fragments, core: core, shock: shock, up: up, size: size, life: 1 });
+  });
+
+  function updateFx(dt) {
+    for (var i = fxList.length - 1; i >= 0; i--) {
+      var ex = fxList[i];
+      ex.life -= dt * 1.6;
+      var t = Math.max(0, ex.life);
+      ex.fragments.forEach(function (f) {
+        f.vel.addScaledVector(ex.up, -0.6 * dt);                  // 外向き重力（落下風）
+        f.vel.multiplyScalar(0.96);
+        f.mesh.position.add(f.vel.clone().multiplyScalar(dt * 60));
+        f.mesh.rotation.x += f.spin.x; f.mesh.rotation.y += f.spin.y; f.mesh.rotation.z += f.spin.z;
+      });
+      ex.core.scale.setScalar(0.4 + t * 1.4);
+      ex.core.material.opacity = t;
+      ex.shock.scale.setScalar(1 + (1 - t) * 6);
+      ex.shock.material.opacity = t * 0.5;
+      if (ex.life <= 0) {
+        ex.fragments.forEach(function (f) { R.scene.remove(f.mesh); });
+        R.scene.remove(ex.core); R.scene.remove(ex.shock);
+        fxList.splice(i, 1);
+      }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  画面シェイク：'playerHit' でカメラを揺らす
+  // ════════════════════════════════════════════════════════════
+  var shake = 0;
+  GAME.on('playerHit', function (d) {
+    var n = (d && d.n) || 10;
+    shake = Math.min(0.6, shake + n * 0.014);                     // ダメージ量に比例・上限あり
+  });
+  function applyShake(dt) {
+    if (shake <= 0) return;
+    var cam = R.camera;                                           // updateCamera の後に走るので上書きOK
+    cam.position.x += (Math.random() - 0.5) * shake;
+    cam.position.y += (Math.random() - 0.5) * shake;
+    cam.position.z += (Math.random() - 0.5) * shake;
+    shake *= Math.max(0, 1 - dt * 9);                             // 指数減衰
+    if (shake < 0.002) shake = 0;
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  新敵：誘導ミサイル
+  // ════════════════════════════════════════════════════════════
+  var ER = 10;                                                   // 地球半径（index.html の const ER = 10 と一致）
+  var missiles = [];
+  var missileTimer = 8;                                           // 初回まで少し猶予
+  var missileBodyMat = new THREE.MeshPhongMaterial({ color: 0xcccccc, emissive: 0x330000, shininess: 60 });
+  var missileNoseMat = new THREE.MeshPhongMaterial({ color: 0xff3322, emissive: 0x551100 });
+  var missileTailMat = new THREE.MeshBasicMaterial({ color: 0xffaa33 });
+
+  function mkMissile() {
+    var g = new THREE.Group();
+    // 進行方向 = lookAt 規約に合わせ -Z（lookAt(進行先) でノーズが対象を向く）
+    var body = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.12, 8), missileBodyMat);
+    body.rotation.x = Math.PI / 2;
+    var nose = new THREE.Mesh(new THREE.ConeGeometry(0.018, 0.05, 8), missileNoseMat);
+    nose.rotation.x = -Math.PI / 2; nose.position.z = -0.085;
+    var tail = new THREE.Mesh(new THREE.SphereGeometry(0.03, 8, 8), missileTailMat);
+    tail.position.z = 0.07;
+    g.add(body); g.add(nose); g.add(tail);
+    g.add(new THREE.PointLight(0xff5522, 1.4, 1.6));
+    return g;
+  }
+
+  function spawnMissile() {
+    var m = mkMissile();
+    var player = R.playerGroup.position;
+    var origin;
+    var bases = R.bases;
+    if (bases && bases.length > 0) {
+      origin = bases[Math.floor(Math.random() * bases.length)].mesh.position.clone();
+      origin.setLength(ER + 0.12);
+    } else {
+      var pAlt = player.length() - ER;
+      origin = player.clone().add(new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(6));
+      origin.setLength(ER + Math.max(0.3, pAlt * 0.5));
+    }
+    m.position.copy(origin);
+    R.scene.add(m);
+    var dir = player.clone().sub(origin).normalize();
+    // speed: 通常UFO(0.035)より速いがブースト(0.08)で振り切れる / turn: 旋回追従の強さ（回避可能）
+    missiles.push({ mesh: m, dir: dir, speed: 0.05, turn: 2.0, life: 9, trailT: 0 });
+    R.showWarn('🚀 誘導ミサイル接近！回避せよ！');
+  }
+
+  function updateMissiles(dt) {
+    var player = R.playerGroup.position;
+    missileTimer -= dt;
+    if (R.playerHP > 0 && missileTimer <= 0 && missiles.length < 4) {
+      spawnMissile();
+      missileTimer = 6 + Math.random() * 5;
+    }
+    var bullets = R.bullets;
+    for (var i = missiles.length - 1; i >= 0; i--) {
+      var m = missiles[i];
+      m.life -= dt;
+      // ホーミング：希望方向へ向きを徐々に補間（旋回レート制限＝回避可能）
+      var desired = player.clone().sub(m.mesh.position).normalize();
+      m.dir.lerp(desired, Math.min(1, m.turn * dt)).normalize();
+      m.mesh.position.addScaledVector(m.dir, m.speed * dt * 60);
+      m.mesh.lookAt(m.mesh.position.clone().add(m.dir));
+      // 排煙トレイル
+      m.trailT -= dt;
+      if (m.trailT <= 0) { spawnSmokePuff(m.mesh.position.clone(), 0.025, 0x888888); m.trailT = 0.045; }
+      // プレイヤー命中
+      if (m.mesh.position.distanceTo(player) < 0.4) {
+        R.damage(15);
+        R.explode(m.mesh.position.clone(), 1.4, 0xff5522);
+        R.scene.remove(m.mesh); missiles.splice(i, 1); continue;
+      }
+      // プレイヤー弾で迎撃可能（小判定・撃墜でスコア）
+      var downed = false;
+      if (bullets) {
+        for (var j = bullets.length - 1; j >= 0; j--) {
+          if (bullets[j].mesh.position.distanceTo(m.mesh.position) < 0.28) {
+            R.explode(m.mesh.position.clone(), 1.0, 0xffcc44);
+            R.scene.remove(bullets[j].mesh); bullets.splice(j, 1);
+            R.addScore(120);
+            downed = true; break;
+          }
+        }
+      }
+      if (downed) { R.scene.remove(m.mesh); missiles.splice(i, 1); continue; }
+      // 寿命切れ / 地表めり込み
+      if (m.life <= 0 || m.mesh.position.length() < ER + 0.05) {
+        R.explode(m.mesh.position.clone(), 0.9, 0xff8844);
+        R.scene.remove(m.mesh); missiles.splice(i, 1);
+      }
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  戦闘機AI修正 ②③：常時移動＋距離で「接近／旋回」2モード（位置を毎フレーム上書き）
+  // ════════════════════════════════════════════════════════════
+  var FIGHTER_ALT_MIN = 0.3;     // 飛行高度の下限（地表へ潜らない）
+  var FIGHTER_ALT_MAX = 0.6;     // 飛行高度の上限（内蔵の巡航高度 ~0.5-0.6 に合わせる）
+  var ORBIT_RADIUS = 0.8;        // 旋回半径（地表接線距離）
+  var NEAR = 1.1;                // この距離以下で旋回モードへ
+  function updateFighterAI(dt) {
+    var enemies = R.enemies;
+    if (!enemies || enemies.length === 0) return;
+    var player = R.playerGroup.position;
+    var playerAlt = player.length() - ER;
+    // 飛行高度：低空のプレイヤーには降りて追う／高高度時は上限で旋回（内蔵巡航帯を踏襲）
+    var flightAlt = clamp(playerAlt * 0.8 + 0.1, FIGHTER_ALT_MIN, FIGHTER_ALT_MAX);
+    var step = dt * 60;                                             // 内蔵AIに合わせフレーム基準
+    for (var i = 0; i < enemies.length; i++) {
+      var e = enemies[i];
+      if (!e.mesh) continue;
+      if (e._orbitDir === undefined) e._orbitDir = (Math.random() < 0.5) ? 1 : -1; // 旋回向きを固定
+      var ePos = e.mesh.position;
+      var up = ePos.clone().normalize();                           // 機体直下の地表法線
+      // プレイヤーへの接線方向（地表面に投影＝水平距離）
+      var toP = player.clone().sub(ePos);
+      var tang = toP.clone().addScaledVector(up, -toP.dot(up));
+      var horiz = tang.length();
+      if (horiz < 1e-4) { tang = new THREE.Vector3(0, 1, 0).cross(up); horiz = tang.length() || 1; }
+      tang.normalize();
+      var speed = Math.max(0.02, e.speed || 0.02);                 // ★常に最低速度（停止しない）
+      var moveDir;
+      if (horiz > NEAR) {
+        // 遠い → 接近
+        moveDir = tang;
+      } else {
+        // 近い → 旋回（接線に直交する向き＝周回）。半径維持の微補正を加える
+        var around = up.clone().cross(tang).multiplyScalar(e._orbitDir);
+        var radial = tang.clone().multiplyScalar((horiz - ORBIT_RADIUS) * 0.6); // 半径へ寄せる
+        moveDir = around.add(radial).normalize();
+      }
+      ePos.addScaledVector(moveDir, speed * step);
+      ePos.setLength(ER + flightAlt);                              // 高度を飛行帯に固定（潜行/停止防止）
+      e.mesh.lookAt(player);                                       // プレイヤーへ正対（射撃方向）
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  ① 戦車の陸地拘束（1号機提供 GAME.isLand を使用）
+  //     地表ユニットは静的なので、陸/海マスク準備後に一度だけ海上の戦車を最寄りの陸へ移設。
+  //     ※ 戦艦(ship)は海でOK・遺跡(landmark)は固定なので対象外。
+  //     ※ 移動するロボ(gundam)は superEnemies が GAME.refs に未公開のため本モジュールでは未対応
+  //        → 1号機に refs.superEnemies 追加を依頼中（追加され次第ここで同様に拘束予定）。
+  // ════════════════════════════════════════════════════════════
+  function posToLatLon(p) {
+    var r = p.length();
+    var lat = Math.asin(clamp(p.y / r, -1, 1)) * 180 / Math.PI;
+    var lon = Math.atan2(p.z, -p.x) * 180 / Math.PI;            // index.html checkZone と同一規約
+    return { lat: lat, lon: lon };
+  }
+  function orientOnSurface(mesh) {
+    var up = mesh.position.clone().normalize();
+    var east = new THREE.Vector3(0, 1, 0).cross(up);
+    if (east.lengthSq() < 0.001) east.set(1, 0, 0);
+    east.normalize();
+    var north = up.clone().cross(east).normalize();
+    mesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(east, up, north)); // placeOnSurface と同等
+  }
+  function bindTanksToLand() {
+    var gu = R.groundUnits;
+    if (!gu) return;
+    var moved = 0;
+    for (var i = 0; i < gu.length; i++) {
+      var u = gu[i];
+      if (u.type !== 'tank' || !u.mesh) continue;
+      var pos = u.mesh.position;
+      if (GAME.isLand(posToLatLon(pos).lat, posToLatLon(pos).lon)) continue;  // 既に陸ならOK
+      // 海 → 地表に沿って周囲を探索し最寄りの陸へ移設
+      var up = pos.clone().normalize();
+      var east = new THREE.Vector3(0, 1, 0).cross(up);
+      if (east.lengthSq() < 0.001) east.set(1, 0, 0);
+      east.normalize();
+      var north = up.clone().cross(east).normalize();
+      var found = null;
+      for (var deg = 1; deg <= 8 && !found; deg++) {
+        for (var a = 0; a < 360; a += 30) {
+          var rad = a * Math.PI / 180;
+          var dir = east.clone().multiplyScalar(Math.cos(rad)).add(north.clone().multiplyScalar(Math.sin(rad)));
+          var axis = up.clone().cross(dir).normalize();          // この軸で回すと dir 方向へ地表移動
+          var cand = pos.clone().applyAxisAngle(axis, deg * Math.PI / 180);
+          var cll = posToLatLon(cand);
+          if (GAME.isLand(cll.lat, cll.lon)) { found = cand; break; }
+        }
+      }
+      if (found) { u.mesh.position.copy(found); orientOnSurface(u.mesh); moved++; }
+    }
+    if (moved > 0) console.log('[3号機] 海上の戦車を陸地へ移設:', moved + '台');
+  }
+  var landBindDone = false;
+  function tryBindTanks() {
+    if (landBindDone) return;
+    if (GAME.isLand(0, -150)) return;   // 既知の海(太平洋中部)が陸=true の間はマスク未準備
+    landBindDone = true;
+    bindTanksToLand();
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  環境演出：雷雲 / オーロラ / 流星群（hoshi要望・GAMEバス接続・index.html無改変）
+  //  いずれも「飛ぶプレイヤー視点の環境」。地表固定不要。雷雲のみ当たり判定（突入で視界悪化）。
+  // ════════════════════════════════════════════════════════════
+  var envT = 0;                                  // 経過時間アキュムレータ（Date.now 非依存）
+
+  // ── 視界悪化用 DOM オーバーレイ（動的生成・index.html 無改変） ──
+  var visOverlay = null, visLevel = 0;
+  function ensureOverlay() {
+    if (visOverlay || typeof document === 'undefined' || !document.body) return;
+    visOverlay = document.createElement('div');
+    visOverlay.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:40;background:#0a0f1e;opacity:0;';
+    document.body.appendChild(visOverlay);
+  }
+
+  // ── 1. 雷雲（暗い雲ボリューム＋稲妻＋突入で視界悪化） ──
+  var clouds = [];
+  var CLOUD_R = 1.6;                             // 突入判定半径
+  function mkCloud() {
+    var g = new THREE.Group();
+    var puffMat = new THREE.MeshPhongMaterial({ color: 0x2a2f3a, emissive: 0x05070c, transparent: true, opacity: 0.85, flatShading: true });
+    for (var i = 0; i < 7; i++) {
+      var s = new THREE.Mesh(new THREE.SphereGeometry(0.5 + Math.random() * 0.5, 8, 6), puffMat);
+      s.position.set((Math.random() - 0.5) * 2.2, (Math.random() - 0.5) * 0.7, (Math.random() - 0.5) * 2.2);
+      s.scale.y = 0.6;
+      g.add(s);
+    }
+    var flash = new THREE.PointLight(0xaaccff, 0, 6);   // 稲妻（通常消灯）
+    g.add(flash);
+    g.userData.flash = flash;
+    g.userData.flashT = 2 + Math.random() * 4;
+    return g;
+  }
+  function initClouds() {
+    for (var i = 0; i < 4; i++) {                // 低〜中空に4カ所（固定ワールド座標）
+      var c = mkCloud();
+      var dir = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
+      c.position.copy(dir.multiplyScalar(ER + 0.6 + Math.random() * 2.0));
+      R.scene.add(c);
+      clouds.push(c);
+    }
+  }
+  function updateClouds(dt) {
+    var player = R.playerGroup.position;
+    var inside = false, nearFlash = 0;
+    for (var i = 0; i < clouds.length; i++) {
+      var c = clouds[i];
+      c.rotation.y += dt * 0.05;
+      var f = c.userData.flash;
+      c.userData.flashT -= dt;
+      if (c.userData.flashT <= 0) {
+        f.intensity = 6;                         // 一瞬光る
+        c.userData.flashT = 2 + Math.random() * 5;
+        GAME.emit('thunder', { pos: c.position.clone() });  // 4号機が sfx 配線できるよう（未配線でも無害）
+      } else {
+        f.intensity *= Math.max(0, 1 - dt * 8);  // 減衰
+      }
+      var d = player.distanceTo(c.position);
+      if (d < CLOUD_R) inside = true;
+      if (d < CLOUD_R * 2) nearFlash = Math.max(nearFlash, (f.intensity / 6) * (1 - d / (CLOUD_R * 2)));
+    }
+    // 視界オーバーレイ：雲内で暗化、近接稲妻で一瞬白フラッシュ（一時的・回復型）
+    ensureOverlay();
+    if (visOverlay) {
+      var target = inside ? 0.6 : 0;
+      visLevel += (target - visLevel) * Math.min(1, dt * 4);     // なめらかに追従
+      if (inside && nearFlash > 0.2) {
+        visOverlay.style.background = '#cfe0ff';
+        visOverlay.style.opacity = String(Math.min(0.75, visLevel + nearFlash * 0.5));
+      } else {
+        visOverlay.style.background = '#0a0f1e';
+        visOverlay.style.opacity = String(visLevel);
+      }
+    }
+  }
+
+  // ── 2. オーロラ（極地上空・緑〜紫の波打つカーテン） ──
+  var auroras = [];
+  function mkAurora(poleSign) {
+    // 極軸まわりの開いた円筒をカーテンに見立て、頂点カラーで緑(下)→紫(上)、加算半透明
+    var geo = new THREE.CylinderGeometry(2.6, 2.6, 2.4, 40, 6, true);
+    var pos = geo.attributes.position, colors = [];
+    for (var i = 0; i < pos.count; i++) {
+      var t = (pos.getY(i) + 1.2) / 2.4;         // 0(下)→1(上)
+      colors.push(0.15 + t * 0.55, 1.0 - t * 0.7, 0.3 + t * 0.65);   // 緑→紫
+    }
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    var mat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.0, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false });
+    var m = new THREE.Mesh(geo, mat);
+    m.position.set(0, poleSign * (ER + 1.8), 0);
+    R.scene.add(m);
+    return { mesh: m, base: geo.attributes.position.array.slice(0), sign: poleSign };
+  }
+  function initAurora() { auroras.push(mkAurora(1)); auroras.push(mkAurora(-1)); }
+  function updateAurora(dt) {
+    var player = R.playerGroup.position;
+    for (var k = 0; k < auroras.length; k++) {
+      var a = auroras[k];
+      a.mesh.rotation.y += dt * 0.08;
+      // 波打ち：半径方向に sin で揺らす
+      var p = a.mesh.geometry.attributes.position, base = a.base;
+      for (var i = 0; i < p.count; i++) {
+        var bx = base[i * 3], by = base[i * 3 + 1], bz = base[i * 3 + 2];
+        var ang = Math.atan2(bz, bx);
+        var w = 1 + 0.12 * Math.sin(ang * 5 + envT * 1.5 + by);
+        p.setX(i, bx * w); p.setZ(i, bz * w);
+      }
+      p.needsUpdate = true;
+      // 極に近いほど濃く（極地を飛ぶと見える）
+      var poleY = a.sign * (ER + 1.8);
+      var distToPole = Math.abs(player.y - poleY) + Math.hypot(player.x, player.z) * 0.5;
+      var vis = clamp(1 - distToPole / 6, 0, 1);
+      a.mesh.material.opacity = vis * (0.35 + 0.15 * Math.sin(envT * 2));   // ゆらぎ
+      a.mesh.visible = vis > 0.02;
+    }
+  }
+
+  // ── 3. 流星群（高高度/宇宙寄りで斜めに走る・当たり判定なし） ──
+  var meteors = [];
+  var meteorTimer = 2;
+  function spawnMeteor() {
+    var cam = R.camera;
+    var fwd = new THREE.Vector3(); cam.getWorldDirection(fwd);
+    var origin = cam.position.clone().addScaledVector(fwd, 30)
+      .add(new THREE.Vector3((Math.random() - 0.5) * 50, (Math.random() - 0.5) * 50, (Math.random() - 0.5) * 50));
+    var vel = new THREE.Vector3(Math.random() - 0.5, -(0.5 + Math.random()), Math.random() - 0.5).normalize().multiplyScalar(18 + Math.random() * 22);
+    var head = new THREE.Mesh(new THREE.SphereGeometry(0.06, 6, 6), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+    head.position.copy(origin);
+    var trail = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([origin.clone(), origin.clone()]),
+      new THREE.LineBasicMaterial({ color: 0x99bbff, transparent: true, opacity: 0.85 })
+    );
+    R.scene.add(head); R.scene.add(trail);
+    meteors.push({ head: head, trail: trail, vel: vel, life: 1.6 });
+  }
+  function updateMeteors(dt) {
+    var playerAlt = R.playerGroup.position.length() - ER;
+    meteorTimer -= dt;
+    if (playerAlt > 2 && meteorTimer <= 0 && meteors.length < 6) {   // 高高度/宇宙寄りでのみ
+      spawnMeteor();
+      meteorTimer = 0.4 + Math.random() * 1.2;
+    }
+    for (var i = meteors.length - 1; i >= 0; i--) {
+      var m = meteors[i];
+      m.life -= dt;
+      var prev = m.head.position.clone();
+      m.head.position.addScaledVector(m.vel, dt);
+      // トレイル（頭の後方へ伸ばす）
+      var tail = m.head.position.clone().addScaledVector(m.vel, -0.12);
+      var arr = m.trail.geometry.attributes.position;
+      arr.setXYZ(0, tail.x, tail.y, tail.z); arr.setXYZ(1, m.head.position.x, m.head.position.y, m.head.position.z);
+      arr.needsUpdate = true;
+      var op = Math.max(0, m.life / 1.6);
+      m.head.material.opacity = op; m.head.material.transparent = true;
+      m.trail.material.opacity = op * 0.85;
+      if (m.life <= 0) {
+        R.scene.remove(m.head); R.scene.remove(m.trail);
+        m.head.geometry.dispose(); m.trail.geometry.dispose();
+        meteors.splice(i, 1);
+      }
+    }
+  }
+
+  function updateEnv(dt) {
+    envT += dt;
+    updateClouds(dt);
+    updateAurora(dt);
+    updateMeteors(dt);
+  }
+
+  // 初期化（scene は GAME 定義後に存在）
+  initClouds();
+  initAurora();
+
+  // ════════════════════════════════════════════════════════════
+  //  毎フレーム集約（1本の onUpdate に集約）
+  // ════════════════════════════════════════════════════════════
+  GAME.onUpdate(function (dt) {
+    tryBindTanks();        // ① 戦車の陸地拘束（マスク準備後に一度だけ実行）
+    updateFighterAI(dt);   // 内蔵戦闘機AIの後に位置を上書き（②③修正）
+    updateMissiles(dt);    // 新敵：誘導ミサイル
+    updateSmoke(dt);       // 煙
+    updateFx(dt);          // 爆発上乗せ演出
+    updateEnv(dt);         // 環境演出：雷雲・オーロラ・流星群
+    applyShake(dt);        // 被弾シェイク（updateCamera の後・render の前）
+  });
+
+  console.log('[3号機] FX/新敵/環境モジュール 読込完了（ミサイル・爆発・シェイク・戦闘機AI・戦車陸地拘束・雷雲/オーロラ/流星群）');
+})();
+</script>
+<script>/* =============================================================================
+ * UFO地球侵略ゲーム — 追加ランドマーク6つ（4号機担当）
+ * 既存ランドマーク(mkPyramid)と同方式の「手描き Three.js(r128)」ジオメトリ。
+ *   各 mkXxx() は THREE.Group を返す（局所 +Y=上、底面 y≈0、MeshPhongMaterial）。
+ *   placeOnSurface(g, lat, lon) で実在の緯度経度に配置し、groundUnits へ
+ *   type:'landmark', hp:999 で登録する。これだけで↓が全て自動的に満たされる:
+ *     ・破壊不可（hit時 type==='landmark' で「神聖な遺跡には傷ひとつ付かない！」）
+ *     ・ロックオン/攻撃対象外（attackable = groundUnits.filter(type!=='landmark')）
+ *     ・自転追従（loop が毎フレーム groundUnits[].mesh を _earthSpin で回す＝
+ *       earthMesh の子にせずワールド座標を保つ既存方式に自動で乗る）
+ *
+ * 統合: 1号機が embed.py で単一HTMLへインライン化（index.html は無改変）。
+ *   既存グローバル placeOnSurface / GAME.refs.{scene,groundUnits} に乗るだけ。
+ * ============================================================================= */
+(function () {
+  'use strict';
+  if (typeof THREE === 'undefined') { return; }
+  var T = THREE;
+  function phong(color, shin) { return new T.MeshPhongMaterial({ color: color, shininess: shin || 8 }); }
+
+  // ── 1. 万里の長城（八達嶺付近・尾根を蛇行する城壁＋望楼）────────────────
+  function mkGreatWall() {
+    var g = new T.Group();
+    var wall = phong(0x8a8275, 4), top = phong(0x6f675a, 4);
+    var N = 10, span = 1.9;
+    for (var i = 0; i < N; i++) {
+      var t = i / (N - 1);
+      var x = (t - 0.5) * span;
+      var z = Math.sin(t * Math.PI * 2) * 0.18;
+      var z2 = Math.sin((t + 0.02) * Math.PI * 2) * 0.18;
+      var ang = Math.atan2(z2 - z, span / (N - 1));
+      var seg = new T.Mesh(new T.BoxGeometry(0.24, 0.14, 0.085), wall);
+      seg.position.set(x, 0.07, z); seg.rotation.y = ang; g.add(seg);
+      var cren = new T.Mesh(new T.BoxGeometry(0.24, 0.035, 0.095), top);  // 上部の狭間
+      cren.position.set(x, 0.155, z); cren.rotation.y = ang; g.add(cren);
+    }
+    [-0.66, 0.0, 0.66].forEach(function (tx) {           // 望楼3基
+      var t = tx / span + 0.5, z = Math.sin(t * Math.PI * 2) * 0.18;
+      var tw = new T.Mesh(new T.BoxGeometry(0.15, 0.26, 0.15), wall);
+      tw.position.set(tx, 0.13, z); g.add(tw);
+      var rf = new T.Mesh(new T.BoxGeometry(0.18, 0.04, 0.18), top);
+      rf.position.set(tx, 0.28, z); g.add(rf);
+    });
+    return g;
+  }
+
+  // ── 2. モアイ（イースター島・アフー台座に石像が整列）──────────────────
+  function mkMoai() {
+    var g = new T.Group();
+    var stone = phong(0x9a9288, 3), ahu = phong(0x55504a, 2), pukao = phong(0x7a3b2a, 4);
+    var base = new T.Mesh(new T.BoxGeometry(1.0, 0.12, 0.24), ahu);
+    base.position.y = 0.06; g.add(base);
+    for (var i = 0; i < 5; i++) {
+      var x = -0.4 + i * 0.2, by = 0.12;
+      var body = new T.Mesh(new T.BoxGeometry(0.13, 0.30, 0.10), stone);
+      body.position.set(x, by + 0.15, 0); g.add(body);
+      var head = new T.Mesh(new T.BoxGeometry(0.115, 0.13, 0.10), stone);
+      head.position.set(x, by + 0.35, 0.006); g.add(head);
+      var nose = new T.Mesh(new T.BoxGeometry(0.04, 0.11, 0.045), stone);  // 鼻/額の張り出し
+      nose.position.set(x, by + 0.33, 0.065); g.add(nose);
+      if (i % 2 === 0) {                                  // プカオ(赤い帽子)
+        var p = new T.Mesh(new T.CylinderGeometry(0.052, 0.052, 0.05, 10), pukao);
+        p.position.set(x, by + 0.45, 0); g.add(p);
+      }
+    }
+    return g;
+  }
+
+  // ── 3. タージマハル（白亜のドーム＋4ミナレット・左右対称）──────────────
+  function mkTajMahal() {
+    var g = new T.Group();
+    var white = phong(0xf2efe9, 30), gold = phong(0xd9c36a, 70);
+    var dome = function (r) { return new T.SphereGeometry(r, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.62); };
+    var plinth = new T.Mesh(new T.BoxGeometry(1.0, 0.08, 1.0), white); plinth.position.y = 0.04; g.add(plinth);
+    var body = new T.Mesh(new T.BoxGeometry(0.6, 0.34, 0.6), white); body.position.y = 0.25; g.add(body);
+    var d = new T.Mesh(dome(0.26), white); d.position.y = 0.42; d.scale.y = 1.25; g.add(d);
+    var spire = new T.Mesh(new T.ConeGeometry(0.03, 0.13, 8), gold); spire.position.y = 0.78; g.add(spire);
+    [-1, 1].forEach(function (sx) {
+      [-1, 1].forEach(function (sz) {
+        var mh = 0.62;
+        var min = new T.Mesh(new T.CylinderGeometry(0.034, 0.04, mh, 10), white);
+        min.position.set(sx * 0.46, 0.08 + mh / 2, sz * 0.46); g.add(min);
+        var cap = new T.Mesh(dome(0.05), white); cap.position.set(sx * 0.46, 0.08 + mh, sz * 0.46); g.add(cap);
+        var cd = new T.Mesh(dome(0.075), white); cd.position.set(sx * 0.22, 0.42, sz * 0.22); g.add(cd); // 隅の小ドーム
+      });
+    });
+    return g;
+  }
+
+  // ── 4. ピサの斜塔（円筒多層をわざと ~5° 傾ける）──────────────────────
+  function mkPisaTower() {
+    var g = new T.Group();
+    var marble = phong(0xeee8dc, 22), gal = phong(0xdcd5c4, 22);
+    var lean = new T.Group(); lean.rotation.z = 0.09;     // ~5°の傾斜が肝
+    var tiers = 8, h = 0.075, r = 0.155, y = 0;
+    for (var i = 0; i < tiers; i++) {
+      var drum = new T.Mesh(new T.CylinderGeometry(r, r, h, 16), marble);
+      drum.position.y = y + h / 2; lean.add(drum);
+      var ring = new T.Mesh(new T.CylinderGeometry(r * 1.05, r * 1.05, h * 0.45, 16), gal); // ガレリア(柱列)
+      ring.position.y = y + h * 0.5; lean.add(ring);
+      y += h;
+    }
+    var bell = new T.Mesh(new T.CylinderGeometry(0.12, 0.13, 0.08, 16), marble);
+    bell.position.y = y + 0.04; lean.add(bell);
+    g.add(lean);
+    return g;
+  }
+
+  // ── 5. シドニーオペラハウス（白い貝殻状シェルが連なる屋根）──────────────
+  function mkOperaHouse() {
+    var g = new T.Group();
+    var white = phong(0xeeeae2, 45), pod = phong(0xcfc9bf, 8);
+    var podium = new T.Mesh(new T.BoxGeometry(1.0, 0.10, 0.6), pod); podium.position.y = 0.05; g.add(podium);
+    function shell(x, z, s, ry) {                          // 帆=半球を縦に潰し傾ける
+      var sh = new T.Mesh(new T.SphereGeometry(0.22 * s, 14, 10, 0, Math.PI, 0, Math.PI), white);
+      sh.scale.set(0.5, 1.5, 1.0);
+      sh.rotation.set(0.5, ry || 0, 0);
+      sh.position.set(x, 0.10, z); g.add(sh);
+    }
+    // 2クラスタ（湾に面して連なる）
+    [[-0.30, 0.02, 1.0, 0.2], [-0.14, 0.06, 0.8, 0.1], [-0.02, 0.0, 0.6, 0.0],
+     [0.30, 0.02, 1.0, -0.2], [0.16, 0.06, 0.8, -0.1], [0.04, 0.0, 0.6, 0.0]
+    ].forEach(function (c) { shell(c[0], c[1], c[2], c[3]); });
+    return g;
+  }
+
+  // ── 6. コロッセオ（楕円アーチ壁・一部崩れ）──────────────────────────
+  function mkColosseum() {
+    var g = new T.Group();
+    var s1 = phong(0xc8b89a, 4), s2 = phong(0xb0a184, 4);
+    var N = 22, rx = 0.6, rz = 0.42;
+    for (var i = 0; i < N; i++) {
+      if (i >= 15 && i <= 18) continue;                    // 崩れた区画
+      var a = i / N * Math.PI * 2;
+      var x = Math.cos(a) * rx, z = Math.sin(a) * rz;
+      var hTop = (i >= 12 && i <= 20) ? 0.22 : 0.34;        // 崩れ際は低く
+      var pil = new T.Mesh(new T.BoxGeometry(0.1, hTop, 0.07), i % 2 ? s1 : s2);
+      pil.position.set(x, hTop / 2, z); pil.rotation.y = -a; g.add(pil);
+      if (hTop > 0.25) {                                    // 上層の梁(アーチ列の示唆)
+        var beam = new T.Mesh(new T.BoxGeometry(0.1, 0.03, 0.06), s2);
+        beam.position.set(x, 0.20, z); beam.rotation.y = -a; g.add(beam);
+      }
+    }
+    var inner = new T.Mesh(new T.CylinderGeometry(0.4, 0.4, 0.08, 24, 1, true), s1); // アリーナ内壁
+    inner.scale.set(1, 1, 0.7); inner.position.y = 0.04; g.add(inner);
+    return g;
+  }
+
+  // ── 配置定義（緯度経度＝実在地点）─────────────────────────────────
+  var LANDMARKS = [
+    { make: mkGreatWall,  lat: 40.43,  lon: 116.57, country: '中国（万里の長城）',           color: 0x8a8275, scale: 1.0 },
+    { make: mkMoai,       lat: -27.12, lon: -109.37, country: 'イースター島（モアイ）',       color: 0x9a9288, scale: 0.85 },
+    { make: mkTajMahal,   lat: 27.17,  lon: 78.04,  country: 'インド（タージマハル）',        color: 0xf2efe9, scale: 0.95 },
+    { make: mkPisaTower,  lat: 43.72,  lon: 10.40,  country: 'イタリア（ピサの斜塔）',        color: 0xeee8dc, scale: 0.95 },
+    { make: mkOperaHouse, lat: -33.86, lon: 151.21, country: 'オーストラリア（オペラハウス）', color: 0xeeeae2, scale: 1.0 },
+    { make: mkColosseum,  lat: 41.89,  lon: 12.49,  country: 'イタリア（コロッセオ）',        color: 0xc8b89a, scale: 1.0 }
+  ];
+
+  var added = false;
+  function addLandmarks() {
+    if (added) return true;
+    var refs = (typeof GAME !== 'undefined' && GAME.refs) ? GAME.refs : null;
+    var scene = refs ? refs.scene : (typeof window !== 'undefined' ? window.scene : null);
+    var gu = refs ? refs.groundUnits : (typeof window !== 'undefined' ? window.groundUnits : null);
+    if (!scene || !gu || typeof placeOnSurface !== 'function') return false; // まだ準備前
+    added = true;
+    for (var i = 0; i < LANDMARKS.length; i++) {
+      var L = LANDMARKS[i];
+      var grp = L.make();
+      placeOnSurface(grp, L.lat, L.lon);     // 既存グローバル：実在緯度経度へ
+      grp.scale.setScalar(L.scale);
+      scene.add(grp);
+      // groundUnits 登録 → 破壊不可・ロックオン除外・自転追従が自動適用
+      gu.push({ mesh: grp, hp: 999, type: 'landmark', country: L.country, color: L.color });
+    }
+    if (typeof log === 'function') log('🗿 追加ランドマーク6基 配置完了');
+    return true;
+  }
+
+  // GAME 準備後に一度だけ実行（embed/script順に依存しないよう多重に保険）
+  if (!addLandmarks()) {
+    if (typeof GAME !== 'undefined' && GAME.onUpdate) {
+      GAME.onUpdate(function () { if (!added) addLandmarks(); });
+    } else {
+      var n = 0;
+      var iv = setInterval(function () { if (addLandmarks() || ++n > 200) clearInterval(iv); }, 100);
+    }
+  }
 })();
 </script>
 </body>
