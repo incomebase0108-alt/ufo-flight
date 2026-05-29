@@ -698,7 +698,7 @@ function spawnBases(){
     placeOnSurface(b, c.baseLat, c.baseLon);
     b.scale.setScalar(1.0);  // 大型化したのでスケール調整
     scene.add(b);
-    bases.push({mesh: b, hp: 8, country: c.name, color: c.color, lat: c.baseLat, lon: c.baseLon, fighterTimer: 0});
+    bases.push({mesh: b, hp: 30, maxHp: 30, country: c.name, color: c.color, lat: c.baseLat, lon: c.baseLon, fighterTimer: 0});
 
     // ★ 基地周辺に戦車3〜4台を配置
     for(let i = 0; i < 4; i++){
@@ -1745,8 +1745,8 @@ function update(dt){
           if(currentTarget === bases[j]) currentTarget = null;
           GAME.emit('baseDestroyed', {country:ba.country, pos:ba.mesh.position.clone()});
           bases.splice(j, 1);
-          addScore(800);
-          showWarn('💥 ' + ba.country + '基地を破壊！+800');
+          addScore(1500);
+          showWarn('💥 ' + ba.country + '基地を破壊！+1500');
         } else {
           explode(b.mesh.position.clone(), 1, 0xffaa00);
         }
@@ -1959,5 +1959,6 @@ if(navigator.geolocation){
   }, () => {}, {timeout:8000});
 }
 </script>
+<script>/*__UPGRADE_SYSTEM__*/</script>
 </body>
 </html>

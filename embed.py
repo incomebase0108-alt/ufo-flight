@@ -36,6 +36,19 @@ if audio_marker in html and os.path.isfile(audio_path):
 else:
     print("オーディオエンジン: プレースホルダ未検出 or ファイル無し（スキップ）")
 
+# 各機の追記モジュール（別ファイル）を単一HTMLにインライン埋め込み
+#   placeholder（index.html内）-> ファイルパス
+INLINE_MODULES = {
+    "/*__UPGRADE_SYSTEM__*/": os.path.join(ROOT, "upgrades", "upgrade-system.js"),  # 2号機
+}
+for mk, path in INLINE_MODULES.items():
+    if mk in html and os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as mf:
+            html = html.replace(mk, mf.read())
+        print("モジュール埋め込み: OK ->", os.path.basename(path))
+    elif mk in html:
+        print("モジュール: ファイル無しでスキップ ->", os.path.basename(path))
+
 out = os.path.join(DIST, "index.html")
 with open(out, "w", encoding="utf-8") as f:
     f.write(html)
