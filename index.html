@@ -517,6 +517,10 @@ GAME.isLand = function(lat, lon){
   const i = (y * W + x) * 4;
   return d[i + 1] > d[i + 2]; // 緑>青 なら陸（海は青>緑）
 };
+// 自機移動速度の倍率（2号機のスピードアップ系アイテム用）。core の UFO 速度に乗算。
+let _speedMul = 1;
+GAME.setSpeedMultiplier = x => { _speedMul = (typeof x === 'number' && x > 0) ? x : 1; };
+GAME.getSpeedMultiplier = () => _speedMul;
 
 // ── Blender製GLBモデルの読み込み・差し替え ───────────────
 // window.GLB_DATA[key] = base64(GLB)。未提供キーは従来のプロシージャル描画に自動フォールバック。
@@ -1531,7 +1535,7 @@ renderMission();
 
 function update(dt){
   const boost = K['shift'];
-  const speed = boost ? 0.08 : 0.035; // UFO通常0.035（戦闘機0.018より速い）、ブースト0.08（圧倒的）
+  const speed = (boost ? 0.08 : 0.035) * _speedMul; // UFO通常0.035／ブースト0.08。_speedMul=2号機のスピードUP
   const altSpd = boost ? 0.3 : 0.1;
 
   // 入力（前後・左右）
