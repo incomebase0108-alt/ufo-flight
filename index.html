@@ -73,6 +73,7 @@ const ER = 10;
 const ALT = 3;
 
 // ★ プレースホルダーの地球（詳細な手描き大陸）
+let _landMask = null; // 陸/海マスク（GAME.isLand 用。大陸キャンバスのピクセル）
 function makePlaceholderTex(){
   const W=2048, H=1024;
   const cv=document.createElement('canvas');
@@ -226,6 +227,9 @@ function makePlaceholderTex(){
   const ctx2 = cv2.getContext('2d');
   ctx2.filter = 'blur(3px)';
   ctx2.drawImage(cv, 0, 0);
+
+  // 陸/海判定用に大陸キャンバス（ぼかし前＝くっきり）のピクセルを保持（GAME.isLand）
+  try { _landMask = { W, H, data: ctx.getImageData(0, 0, W, H).data }; } catch(e){ _landMask = null; }
 
   return new THREE.CanvasTexture(cv2);
 }
@@ -502,6 +506,17 @@ GAME.onFire = fn => { if(typeof fn === 'function') _fireHandlers.push(fn); };
 // 被ダメージ修飾フック（2号機のシールド等）：fn(n) => 修正後n（0以下なら無効化＝被弾なし）
 const _damageMods = [];
 GAME.onDamage = fn => { if(typeof fn === 'function') _damageMods.push(fn); };
+// 陸/海判定（3号機の地表ユニット陸地拘束用）。地球の大陸キャンバスをサンプリング（緑=陸/青=海）。
+GAME.isLand = function(lat, lon){
+  if(!_landMask) return true; // 不明時は陸扱い（海に出さない安全側）
+  const W = _landMask.W, H = _landMask.H, d = _landMask.data;
+  let x = Math.floor((((((lon + 180) % 360) + 360) % 360) / 360) * W);
+  let y = Math.floor(((90 - lat) / 180) * H);
+  x = Math.max(0, Math.min(W - 1, x));
+  y = Math.max(0, Math.min(H - 1, y));
+  const i = (y * W + x) * 4;
+  return d[i + 1] > d[i + 2]; // 緑>青 なら陸（海は青>緑）
+};
 
 // ── Blender製GLBモデルの読み込み・差し替え ───────────────
 // window.GLB_DATA[key] = base64(GLB)。未提供キーは従来のプロシージャル描画に自動フォールバック。
