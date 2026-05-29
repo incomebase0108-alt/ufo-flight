@@ -3,6 +3,9 @@
 Three.js 製の 3D 飛行シューティング（地球を飛んで各国の領空・基地・艦隊と戦う）。
 簡易プリミティブ製だったモデルを Blender 5.1 製の高精細 GLB に差し替える改造中。
 
+🎮 **遊ぶ（公開URL）**: https://incomebase0108-alt.github.io/ufo-flight/
+（GitHub Pages / master の `docs/index.html` を配信。`embed.py` 実行で `dist/` と `docs/` 両方更新）
+
 ## 構成
 - `index.html` … ゲーム本体（単一HTML。GLB は base64 で埋め込む）
 - `blender/` … モデル生成スクリプト
