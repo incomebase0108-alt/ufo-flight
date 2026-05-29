@@ -58,11 +58,15 @@ function log(s){ status.innerHTML = s; }
 log('Three.js<br>初期化中');
 
 const MOB = innerWidth < 800;
+// ★ パフォーマンス上限（スマホのカクつき対策＝オブジェクト数とGC churn を抑える）
+const MAX_BULLETS  = MOB ? 70  : 140;  // プレイヤー弾
+const MAX_EBULLETS = MOB ? 90  : 180;  // 敵弾
+const MAX_ENEMIES  = MOB ? 14  : 24;   // 戦闘機・艦載機
 
 const canvas = document.getElementById('gc');
 const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
 renderer.setSize(innerWidth, innerHeight);
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(devicePixelRatio, MOB ? 1.5 : 2)); // スマホは解像度上限を下げて軽量化
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x000510);
@@ -476,6 +480,9 @@ const enemyBulletMat  = new THREE.MeshBasicMaterial({color:0xff6622});
 //    'explosion'      {pos,size,color}     爆発（演出/SE用）
 // ══════════════════════════════════════════════════════════════
 window.GAME = window.GAME || {};
+// 低スペック(スマホ)向け設定。各機が参照して演出/エフェクトを間引く。
+GAME.lowSpec = MOB;
+GAME.perf = { particleScale: MOB ? 0.5 : 1, maxBullets: MAX_BULLETS };
 const _updateHooks = [];
 GAME.onUpdate = fn => { if(typeof fn === 'function') _updateHooks.push(fn); };
 const _evtMap = {};
@@ -669,6 +676,8 @@ function checkZone(){
 function scrambleFighters(country){
   const numFighters = 3 + Math.floor(Math.random() * 2);
   for(let i = 0; i < numFighters; i++){
+    if(enemies.length >= MAX_ENEMIES) break; // 戦闘機の上限
+
     // 基地から少し離れた場所に出現
     const latOff = (Math.random() - 0.5) * 10;
     const lonOff = (Math.random() - 0.5) * 10;
@@ -783,6 +792,7 @@ function playerFire(){
 
 // 敵が弾を発射
 function enemyFire(enemy){
+  if(eBullets.length >= MAX_EBULLETS) return; // 敵弾の上限
   const dir = playerGroup.position.clone().sub(enemy.mesh.position).normalize();
   // 精度を少し下げる
   dir.x += (Math.random() - 0.5) * 0.1;
@@ -1125,6 +1135,7 @@ function fireMulti(){
 const _origPlayerFire = playerFire;
 playerFire = function(){
   if(playerHP <= 0) return;
+  if(bullets.length >= MAX_BULLETS) return; // 上限超で打ち止め（カクつき対策）
   GAME.emit('playerFire');
   // 2号機の発射拡張（散弾/貫通レーザー/メガビーム等）。true を返したら既定発射はスキップ
   for(let i = 0; i < _fireHandlers.length; i++){ try { if(_fireHandlers[i]()) return; } catch(e){ console.warn('fire handler', e); } }
@@ -1316,6 +1327,7 @@ function spawnGundam(){
 }
 
 function superFire(se, n, spread){
+  if(eBullets.length >= MAX_EBULLETS) return; // 敵弾の上限
   const dir0 = playerGroup.position.clone().sub(se.mesh.position).normalize();
   const axis = se.mesh.position.clone().normalize();
   for(let k = 0; k < n; k++){
