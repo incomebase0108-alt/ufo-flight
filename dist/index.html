@@ -448,6 +448,53 @@ const bulletGeo = new THREE.SphereGeometry(0.03, 6, 6);
 const playerBulletMat = new THREE.MeshBasicMaterial({color:0x00ffee});
 const enemyBulletMat  = new THREE.MeshBasicMaterial({color:0xff6622});
 
+// ══════════════════════════════════════════════════════════════
+//  4機分担用 土台：イベントバス＋更新フック＋共有参照（追記モジュール式）
+//  各機は自分のモジュールを「末尾に追記」し、GAME.onUpdate / GAME.on で接続する。
+//  既存コードは触らず、ここに乗せるだけで統合衝突を避ける。
+//
+//  ◇ 毎フレーム処理:   GAME.onUpdate(fn)         // fn(dt)
+//  ◇ イベント購読:     GAME.on(name, fn)         // fn(data)
+//  ◇ イベント発火:     GAME.emit(name, data)
+//  ◇ 主要参照/操作:    GAME.refs.{scene,camera,playerGroup,enemies,bases,
+//                       groundUnits,bullets,eBullets,score,playerHP,
+//                       addScore(n),damage(n),heal(n),explode(pos,size,color),
+//                       showWarn(msg),aimDir()}
+//
+//  ◇ 発火されるイベント（1号機が設置済み）:
+//    'playerFire'                          発射
+//    'enemyDestroyed' {type,country,pos}   戦闘機/メカ撃墜
+//    'baseDestroyed'  {country,pos}        基地破壊
+//    'unitDestroyed'  {type,country,pos}   戦艦/戦車など撃破（type:'ship'|'tank'…）
+//    'bossDestroyed'  {type,pos,score}     ボス撃破
+//    'playerHit'      {n}                  被弾
+//    'explosion'      {pos,size,color}     爆発（演出/SE用）
+// ══════════════════════════════════════════════════════════════
+window.GAME = window.GAME || {};
+const _updateHooks = [];
+GAME.onUpdate = fn => { if(typeof fn === 'function') _updateHooks.push(fn); };
+const _evtMap = {};
+GAME.on = (name, fn) => { (_evtMap[name] = _evtMap[name] || []).push(fn); };
+GAME.emit = (name, data) => { const a = _evtMap[name]; if(a) for(let i=0;i<a.length;i++){ try{ a[i](data); }catch(e){ console.warn('hook error',name,e); } } };
+GAME.refs = {
+  get scene(){ return scene; },
+  get camera(){ return camera; },
+  get playerGroup(){ return playerGroup; },
+  get enemies(){ return enemies; },
+  get bases(){ return bases; },
+  get groundUnits(){ return groundUnits; },
+  get bullets(){ return bullets; },
+  get eBullets(){ return eBullets; },
+  get score(){ return gameScore; },
+  get playerHP(){ return playerHP; },
+  addScore(n){ addScore(n); },
+  damage(n){ damage(n); },
+  heal(n){ healPlayer(n); },
+  explode(pos, size, color){ explode(pos, size, color); },
+  showWarn(msg){ showWarn(msg); },
+  aimDir(){ return getAimDir(); },
+};
+
 // ── Blender製GLBモデルの読み込み・差し替え ───────────────
 // window.GLB_DATA[key] = base64(GLB)。未提供キーは従来のプロシージャル描画に自動フォールバック。
 const GLB_TEMPLATES = {};
@@ -603,10 +650,10 @@ function scrambleFighters(country){
     scene.add(f);
     enemies.push({
       mesh: f,
-      hp: 2,
+      hp: 2 + Math.floor(GAME.difficulty || 0),                 // ミッション進行でタフに
       country: country.name,
       shootTimer: 1 + Math.random() * 2,
-      speed: 0.018,  // 戦闘機（マッハ2相当）- UFO通常0.035より遅く、UFOから逃げられる
+      speed: 0.018 + (GAME.difficulty || 0) * 0.004,  // ミッション進行で速く（UFO通常0.035より遅く、逃げられる範囲）
     });
   }
   showWarn('⚠ ' + country.name + ' スクランブル発進！');
@@ -722,6 +769,7 @@ function enemyFire(enemy){
 
 // 爆発
 function explode(pos, size, color){
+  GAME.emit('explosion', {pos, size, color});
   const particles = [];
   for(let i = 0; i < 10; i++){
     const p = new THREE.Mesh(
@@ -751,6 +799,7 @@ function addScore(n){
 }
 
 function damage(n){
+  GAME.emit('playerHit', {n});
   playerHP -= n;
   if(playerHP < 0) playerHP = 0;
   document.getElementById('hp').textContent = playerHP;
@@ -1045,6 +1094,7 @@ function fireMulti(){
 const _origPlayerFire = playerFire;
 playerFire = function(){
   if(playerHP <= 0) return;
+  GAME.emit('playerFire');
   if(beamTimer > 0){ fireBeam(); return; }
   if(multiTimer > 0){ fireMulti(); return; }
   _origPlayerFire();
@@ -1173,7 +1223,8 @@ function mkGundam(){
 
 // ── ボス/メカ管理 ──
 const superEnemies = [];
-let nextBossScore = 1500;
+let nextBossScore = 4000;            // UFO母艦（ボス）出現スコア
+let battleshipBossSpawned = false;   // 超大型戦艦ボスは一度だけ
 let gundamTimer = 20;
 
 // 地表基準に直立させ、対象（プレイヤー）方向へ向ける
@@ -1191,15 +1242,30 @@ function orientToSurface(mesh, facePos){
   mesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(right, up, fwd));
 }
 
-function spawnBoss(){
+function spawnBoss(){  // UFO母艦（高高度に出現・ミサイル連射）
   const mesh = mkMothership();
   const p = playerGroup.position;
   const dir = getAimDir();
-  mesh.position.copy(p).addScaledVector(dir, 6).addScaledVector(p.clone().normalize(), 1.5);
-  if(mesh.position.length() < ER + 1.0) mesh.position.setLength(ER + 1.0);
+  // プレイヤー前方かつ上空（高高度）に出現
+  mesh.position.copy(p).addScaledVector(dir, 6).addScaledVector(p.clone().normalize(), 2.5);
+  if(mesh.position.length() < ER + 1.5) mesh.position.setLength(ER + 1.5);
   scene.add(mesh);
-  superEnemies.push({mesh, type:'boss', hp:60, maxHp:60, radius:1.8, score:3000, speed:0.02, shootTimer:2.5, contactTimer:0});
-  showWarn('🛸 UFO母艦 出現！総攻撃を仕掛けてくる！');
+  superEnemies.push({mesh, type:'boss', hp:50, maxHp:50, radius:1.8, score:5000, speed:0.022, shootTimer:2.0, contactTimer:0});
+  showWarn('🛸 UFO母艦 高高度に出現！ミサイルの雨が来る！');
+}
+
+function spawnBattleshipBoss(){  // 超大型戦艦（海上・艦載機を発進）
+  const mesh = mkBattleship(0x99aacc);
+  mesh.scale.setScalar(4.0);
+  const p = playerGroup.position;
+  const dir = getAimDir();
+  const pos = p.clone().addScaledVector(dir, 5);
+  pos.setLength(ER); // 地表（海面）
+  mesh.position.copy(pos);
+  orientToSurface(mesh, p);
+  scene.add(mesh);
+  superEnemies.push({mesh, type:'battleship', hp:30, maxHp:30, radius:1.6, score:3000, speed:0, shootTimer:2, launchTimer:3});
+  showWarn('🚢 超大型戦艦 出現！艦載機を発進させてくる！');
 }
 
 function spawnGundam(){
@@ -1229,10 +1295,14 @@ function superFire(se, n, spread){
 }
 
 function updateSuperEnemies(dt){
-  // スポーン制御
+  // ── スポーン制御 ──
+  if(playerHP > 0 && !battleshipBossSpawned && gameScore >= 2000){
+    spawnBattleshipBoss();
+    battleshipBossSpawned = true;
+  }
   if(playerHP > 0 && gameScore >= nextBossScore && !superEnemies.some(s => s.type === 'boss')){
     spawnBoss();
-    nextBossScore += 4000;
+    nextBossScore += 6000;
   }
   gundamTimer -= dt;
   if(playerHP > 0 && gundamTimer <= 0 && superEnemies.filter(s => s.type === 'gundam').length < 2){
@@ -1247,17 +1317,33 @@ function updateSuperEnemies(dt){
     const dist = toP.length();
 
     if(se.type === 'boss'){
-      // 母艦：3Dでプレイヤーを追うが一定距離を保つ。高高度も追える。
-      if(dist > 3.2) se.mesh.position.addScaledVector(toP.clone().normalize(), se.speed);
+      // UFO母艦：3Dで追跡（高高度も）・一定距離保持・ミサイル弾幕
+      if(dist > 3.5) se.mesh.position.addScaledVector(toP.clone().normalize(), se.speed);
       if(se.mesh.position.length() < ER + 1.0) se.mesh.position.setLength(ER + 1.0);
       orientToSurface(se.mesh, pPos);
       se.mesh.rotation.y += 0.004;
       se.shootTimer -= dt;
-      if(se.shootTimer <= 0 && dist < 10){ superFire(se, 7, 0.9); se.shootTimer = 2.2; }
+      if(se.shootTimer <= 0 && dist < 12){ superFire(se, 8, 1.0); se.shootTimer = 1.8; }
       se.contactTimer -= dt;
       if(dist < se.radius && se.contactTimer <= 0){ damage(8); se.contactTimer = 1; }
+    } else if(se.type === 'battleship'){
+      // 超大型戦艦：海上に静止・艦載機を発進・主砲射撃
+      orientToSurface(se.mesh, pPos);
+      se.shootTimer -= dt;
+      if(se.shootTimer <= 0 && dist < 14){ superFire(se, 4, 0.5); se.shootTimer = 2.2; }
+      se.launchTimer -= dt;
+      if(se.launchTimer <= 0 && enemies.length < 12){
+        const f = mkFighter(0x99aacc);
+        f.position.copy(se.mesh.position)
+          .addScaledVector(toP.clone().normalize(), 0.6)
+          .addScaledVector(se.mesh.position.clone().normalize(), 0.8);
+        f.scale.setScalar(1.0);
+        scene.add(f);
+        enemies.push({mesh:f, hp:2, country:'艦載機', shootTimer:1 + Math.random()*2, speed:0.02 + (GAME.difficulty||0)*0.004});
+        se.launchTimer = 4;
+      }
     } else {
-      // ガンダム：低空維持でプレイヤーを追い、こちらを向いて射撃
+      // ガンダム風メカ：低空維持で正対追跡・射撃
       const FMAX = 0.35;
       let target = pPos.clone();
       if(pPos.length() - ER > FMAX) target = pPos.clone().normalize().multiplyScalar(ER + FMAX);
@@ -1277,11 +1363,16 @@ function updateSuperEnemies(dt){
         se.hp -= b.dmg;
         scene.remove(b.mesh); bullets.splice(j,1);
         if(se.hp <= 0){
-          explode(se.mesh.position.clone(), se.type === 'boss' ? 6 : 2, se.type === 'boss' ? 0x66ccff : 0xffaa33);
+          const big = (se.type === 'boss' || se.type === 'battleship');
+          const col = se.type === 'boss' ? 0x66ccff : se.type === 'battleship' ? 0xffcc66 : 0xffaa33;
+          explode(se.mesh.position.clone(), big ? 7 : 2, col);
           scene.remove(se.mesh);
           if(currentTarget === se) currentTarget = null;
           addScore(se.score);
-          showWarn(se.type === 'boss' ? '🛸 UFO母艦 撃破！+' + se.score : '🤖 メカ撃破！+' + se.score);
+          const nm = se.type === 'boss' ? '🛸 UFO母艦' : se.type === 'battleship' ? '🚢 超大型戦艦' : '🤖 メカ';
+          showWarn(nm + ' 撃破！＋' + se.score);
+          if(big) GAME.emit('bossDestroyed', {type:se.type, pos:se.mesh.position.clone(), score:se.score});
+          else    GAME.emit('enemyDestroyed', {type:'mecha', country:'', pos:se.mesh.position.clone()});
           superEnemies.splice(i,1);
           break;
         } else {
@@ -1291,11 +1382,12 @@ function updateSuperEnemies(dt){
     }
   }
 
-  // ボスHPバー表示更新
-  const boss = superEnemies.find(s => s.type === 'boss');
+  // ボスHPバー表示（母艦 or 超大型戦艦）
+  const boss = superEnemies.find(s => s.type === 'boss' || s.type === 'battleship');
   if(boss){
     bossBar.style.display = 'block';
     bossFill.style.width = Math.max(0, boss.hp / boss.maxHp * 100) + '%';
+    bossLabel.textContent = boss.type === 'boss' ? '🛸 UFO MOTHERSHIP' : '🚢 SUPER BATTLESHIP';
   } else {
     bossBar.style.display = 'none';
   }
@@ -1316,7 +1408,72 @@ function updateExtras(dt){
   updatePowerups(dt);
   updateSuperEnemies(dt);
   updateExtraHud();
+  // 各機モジュールの毎フレーム処理（追記モジュール式）
+  for(let i = 0; i < _updateHooks.length; i++){
+    try { _updateHooks[i](dt); } catch(e){ console.warn('update hook error', e); }
+  }
 }
+
+// ══════════════════════════════════════════════════════════════
+//  【1号機】ミッション制＆難易度（イベント駆動・追記モジュール）
+//  東京基地破壊 → 米戦闘機10撃墜 → 敵艦隊4撃沈 → 全基地破壊 → 達成+1000・難易度UP
+// ══════════════════════════════════════════════════════════════
+GAME.difficulty = 0;
+
+// ミッションHUD（画面上部中央）
+const missionHud = document.createElement('div');
+missionHud.style.cssText = 'position:fixed;top:74px;left:50%;transform:translateX(-50%);min-width:280px;max-width:92vw;background:rgba(0,0,0,.55);border:1px solid rgba(0,220,255,.4);border-radius:6px;padding:6px 14px;color:#cdebff;font-family:monospace;font-size:12px;letter-spacing:1px;z-index:10;pointer-events:none;text-align:center';
+const missionLabel = document.createElement('div');
+missionLabel.style.cssText = 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+missionHud.appendChild(missionLabel);
+const missionBarWrap = document.createElement('div');
+missionBarWrap.style.cssText = 'margin-top:5px;height:7px;background:rgba(255,255,255,.12);border-radius:4px;overflow:hidden';
+const missionBarFill = document.createElement('div');
+missionBarFill.style.cssText = 'height:100%;width:0%;background:linear-gradient(90deg,#00e8ff,#00ffaa);transition:width .2s';
+missionBarWrap.appendChild(missionBarFill);
+missionHud.appendChild(missionBarWrap);
+document.body.appendChild(missionHud);
+
+// 累積カウンタ（イベントで加算）
+const mCount = { tokyoBase:0, usFighter:0, ships:0, bases:0 };
+const MISSIONS = [
+  {id:'tokyo', label:'🗼 東京（日本）の基地を破壊せよ', need:1, get prog(){ return mCount.tokyoBase; }},
+  {id:'usf',   label:'✈ アメリカ戦闘機を撃墜せよ',       need:10, get prog(){ return mCount.usFighter; }},
+  {id:'ships', label:'🚢 敵艦隊を撃沈せよ',               need:4, get prog(){ return mCount.ships; }},
+  {id:'bases', label:'🏯 すべての敵基地を破壊せよ',       need:4, get prog(){ return mCount.bases; }},
+];
+let missionIdx = 0;
+let missionAllDone = false;
+
+function renderMission(){
+  if(missionAllDone){
+    missionLabel.textContent = '🎖 全ミッション達成！ SURVIVAL';
+    missionBarFill.style.width = '100%';
+    return;
+  }
+  const m = MISSIONS[missionIdx];
+  missionLabel.textContent = 'MISSION ' + (missionIdx + 1) + '/' + MISSIONS.length + '：' + m.label + '   ' + Math.min(m.prog, m.need) + '/' + m.need;
+  missionBarFill.style.width = Math.min(100, m.prog / m.need * 100) + '%';
+}
+
+function checkMission(){
+  while(!missionAllDone && missionIdx < MISSIONS.length && MISSIONS[missionIdx].prog >= MISSIONS[missionIdx].need){
+    GAME.refs.showWarn('✅ 目標達成：' + MISSIONS[missionIdx].label);
+    missionIdx++;
+    if(missionIdx >= MISSIONS.length){
+      missionAllDone = true;
+      GAME.refs.addScore(1000);
+      GAME.difficulty += 1;
+      GAME.refs.showWarn('🎖 全ミッション達成！＋1000　以後サバイバル（敵が強化）');
+    }
+  }
+  renderMission();
+}
+
+GAME.on('baseDestroyed', d => { mCount.bases++; if(d && d.country === '日本') mCount.tokyoBase++; checkMission(); });
+GAME.on('enemyDestroyed', d => { if(d && d.type === 'fighter' && d.country === 'アメリカ') mCount.usFighter++; checkMission(); });
+GAME.on('unitDestroyed', d => { if(d && d.type === 'ship') mCount.ships++; checkMission(); });
+renderMission();
 
 function update(dt){
   const boost = K['shift'];
@@ -1527,6 +1684,7 @@ function update(dt){
           explode(e.mesh.position.clone(), 1.5, 0xff6600);
           scene.remove(e.mesh);
           if(currentTarget === enemies[j]) currentTarget = null;
+          GAME.emit('enemyDestroyed', {type:'fighter', country:e.country, pos:e.mesh.position.clone()});
           enemies.splice(j, 1);
           addScore(100);
         }
@@ -1546,6 +1704,7 @@ function update(dt){
           explode(ba.mesh.position.clone(), 5, ba.color);
           scene.remove(ba.mesh);
           if(currentTarget === bases[j]) currentTarget = null;
+          GAME.emit('baseDestroyed', {country:ba.country, pos:ba.mesh.position.clone()});
           bases.splice(j, 1);
           addScore(800);
           showWarn('💥 ' + ba.country + '基地を破壊！+800');
@@ -1579,6 +1738,7 @@ function update(dt){
           explode(u.mesh.position.clone(), sz, u.color);
           scene.remove(u.mesh);
           if(currentTarget === groundUnits[j]) currentTarget = null;
+          GAME.emit('unitDestroyed', {type:u.type, country:u.country, pos:u.mesh.position.clone()});
           groundUnits.splice(j, 1);
           addScore(score);
           if(u.type === 'ship') showWarn('🚢 ' + u.country + '撃沈！+300');
