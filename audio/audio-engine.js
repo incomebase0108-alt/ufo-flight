@@ -212,6 +212,16 @@
       for (var j = 0; j < ch.length; j++) {
         tone({ type: 'triangle', freq: hz(ch[j]), t0: t + 0.5, dur: 0.55, attack: 0.01, release: 0.2, peak: 0.22 });
       }
+    },
+    // 雷鳴: 3号機の雷雲が emit('thunder') した時に鳴らす。鋭いクラック＋低く転がる轟き。
+    thunder: function () {
+      if (!ctx) return;
+      var t = ctx.currentTime;
+      noise({ t0: t, dur: 0.18, peak: 0.85, type: 'highpass', freq: 2200, glideTo: 600 });          // 初撃のクラック
+      noise({ t0: t, dur: 0.10, peak: 0.5, type: 'bandpass', freq: 3400, q: 0.7 });
+      noise({ t0: t + 0.04, dur: 1.3, peak: 0.7, type: 'lowpass', freq: 900, glideTo: 90, q: 0.6 }); // 低く尾を引く轟き
+      tone({ type: 'sine', freq: 70, glideTo: 36, t0: t + 0.05, dur: 1.1, attack: 0.02, release: 0.3, peak: 0.5 });
+      noise({ t0: t + 0.45, dur: 0.8, peak: 0.4, type: 'lowpass', freq: 520, glideTo: 80 });         // ゴロゴロ転がる余韻
     }
   };
 
@@ -329,4 +339,19 @@
     setSfxVolume: setSfxVolume,
     toggleMute: toggleMute
   };
+
+  // ── 3号機の雷雲が emit('thunder') した時に雷鳴SEを自動再生（GAMEバス配線）──
+  //   GAME が後ロードでも拾えるよう、配線できるまで短時間リトライ（未配線でも無害）。
+  var _thunderWired = false;
+  function wireThunder() {
+    if (_thunderWired) return true;
+    if (typeof GAME === 'undefined' || !GAME.on) return false;
+    _thunderWired = true;
+    GAME.on('thunder', function () { try { sfx.thunder(); } catch (e) {} });
+    return true;
+  }
+  if (!wireThunder()) {
+    var _tn = 0;
+    var _tiv = setInterval(function () { if (wireThunder() || ++_tn > 200) clearInterval(_tiv); }, 100);
+  }
 })(typeof window !== 'undefined' ? window : this);
