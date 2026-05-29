@@ -959,7 +959,7 @@ function findTarget(){
   let bestScore = -Infinity;
   // ピラミッド以外をターゲットに
   const attackable = groundUnits.filter(u => u.type !== 'landmark');
-  const candidates = [...enemies, ...bases, ...attackable];
+  const candidates = [...enemies, ...bases, ...attackable, ...(typeof superEnemies !== 'undefined' ? superEnemies : [])];
   for(const t of candidates){
     const toT = t.mesh.position.clone().sub(p);
     const dist = toT.length();
@@ -974,6 +974,347 @@ function findTarget(){
     }
   }
   return target;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  追加要素：パワーアップアイテム / ボスUFO母艦 / ガンダム風メカ
+//  既存ループは触らず、updateExtras(dt) を update() から1回呼ぶ方式。
+// ══════════════════════════════════════════════════════════════
+
+// ── 強化状態 ──
+let beamTimer  = 0;   // ビーム砲の残り秒
+let multiTimer = 0;   // 3連装の残り秒
+
+// ── パワーアップHUD ──
+const puHud = document.createElement('div');
+puHud.style.cssText = 'position:fixed;bottom:200px;left:50%;transform:translateX(-50%);color:#ffe54a;font-size:12px;font-family:monospace;letter-spacing:2px;text-shadow:0 0 8px #000;z-index:10;pointer-events:none;text-align:center;white-space:nowrap';
+document.body.appendChild(puHud);
+
+// ── ボスHPバー ──
+const bossBar = document.createElement('div');
+bossBar.style.cssText = 'position:fixed;top:46px;left:50%;transform:translateX(-50%);width:320px;max-width:80vw;height:14px;background:rgba(0,0,0,.6);border:1px solid rgba(255,80,80,.6);z-index:10;pointer-events:none;display:none';
+const bossFill = document.createElement('div');
+bossFill.style.cssText = 'height:100%;width:100%;background:linear-gradient(90deg,#ff2200,#ff8800);transition:width .15s';
+const bossLabel = document.createElement('div');
+bossLabel.style.cssText = 'position:absolute;top:-16px;left:0;width:100%;text-align:center;color:#ff6644;font-size:11px;font-family:monospace;letter-spacing:2px';
+bossLabel.textContent = '🛸 UFO MOTHERSHIP';
+bossBar.appendChild(bossFill);
+bossBar.appendChild(bossLabel);
+document.body.appendChild(bossBar);
+
+// ── 共通：発射方向（ロックオン優先・なければ前方） ──
+function getAimDir(){
+  const p = playerGroup.position;
+  if(currentTarget) return currentTarget.mesh.position.clone().sub(p).normalize();
+  const outward = p.clone().normalize();
+  let e = new THREE.Vector3(0,1,0).cross(outward);
+  if(e.lengthSq() < 0.001) e.set(1,0,0);
+  e.normalize();
+  const n = outward.clone().cross(e).normalize();
+  return n.multiplyScalar(Math.cos(camYaw)).add(e.multiplyScalar(Math.sin(camYaw)));
+}
+
+// ── ビーム砲（強力・貫通的に高ダメージ） ──
+const _beamGeo = new THREE.CylinderGeometry(0.02, 0.02, 0.5, 8);
+const _beamMat = new THREE.MeshBasicMaterial({color:0x66ffff});
+function fireBeam(){
+  const p = playerGroup.position;
+  const dir = getAimDir();
+  const b = new THREE.Mesh(_beamGeo, _beamMat);
+  b.position.copy(p);
+  b.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir);
+  scene.add(b);
+  bullets.push({mesh:b, vel:dir.clone().multiplyScalar(3.4), life:2.2, dmg:5});
+}
+
+// ── 3連装ショット ──
+function fireMulti(){
+  const p = playerGroup.position;
+  const base = getAimDir();
+  const axis = p.clone().normalize();
+  for(let k = -1; k <= 1; k++){
+    const dir = base.clone().applyAxisAngle(axis, k * 0.22);
+    const b = new THREE.Mesh(bulletGeo, playerBulletMat);
+    b.position.copy(p);
+    scene.add(b);
+    bullets.push({mesh:b, vel:dir.multiplyScalar(2.5), life:3, dmg:1});
+  }
+}
+
+// playerFire を強化状態対応に差し替え（通常時は元の挙動）
+const _origPlayerFire = playerFire;
+playerFire = function(){
+  if(playerHP <= 0) return;
+  if(beamTimer > 0){ fireBeam(); return; }
+  if(multiTimer > 0){ fireMulti(); return; }
+  _origPlayerFire();
+};
+
+// ── HP回復 ──
+function healPlayer(n){
+  playerHP = Math.min(100, playerHP + n);
+  document.getElementById('hp').textContent = playerHP;
+  document.getElementById('hp').style.color = playerHP > 50 ? '#00ff64' : playerHP > 20 ? '#ffaa00' : '#ff2200';
+}
+
+// ── パワーアップアイテム ──
+const powerups = [];
+let powerupTimer = 8;
+const PU_TYPES = {
+  beam: {color:0x00ffee, label:'⚡BEAM'},
+  multi:{color:0xff44ff, label:'﹅MULTI'},
+  heal: {color:0x33ff66, label:'✚HEAL'},
+};
+function spawnPowerup(){
+  const keys = Object.keys(PU_TYPES);
+  const type = keys[Math.floor(Math.random()*keys.length)];
+  const col = PU_TYPES[type].color;
+  const g = new THREE.Group();
+  const core = new THREE.Mesh(new THREE.IcosahedronGeometry(0.08,0), new THREE.MeshBasicMaterial({color:col}));
+  g.add(core);
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.13,0.02,6,18), new THREE.MeshBasicMaterial({color:col, transparent:true, opacity:0.8}));
+  g.add(ring);
+  g.add(new THREE.PointLight(col, 1.2, 1.5));
+  // プレイヤーの少し前方・同高度に出現
+  const p = playerGroup.position;
+  const dir = getAimDir();
+  g.position.copy(p).addScaledVector(dir, 2.2 + Math.random()*1.5);
+  scene.add(g);
+  powerups.push({mesh:g, type, ring, life:22});
+}
+function updatePowerups(dt){
+  powerupTimer -= dt;
+  if(powerupTimer <= 0 && powerups.length < 3){
+    spawnPowerup();
+    powerupTimer = 14 + Math.random()*8;
+  }
+  for(let i = powerups.length-1; i >= 0; i--){
+    const pu = powerups[i];
+    pu.ring.rotation.z += 0.06;
+    pu.mesh.rotation.y += 0.03;
+    pu.life -= dt;
+    if(pu.life <= 0){ scene.remove(pu.mesh); powerups.splice(i,1); continue; }
+    if(pu.mesh.position.distanceTo(playerGroup.position) < 0.6){
+      const col = PU_TYPES[pu.type].color;
+      explode(pu.mesh.position.clone(), 0.6, col);
+      if(pu.type === 'beam'){  beamTimer = 14; multiTimer = 0; showWarn('⚡ ビーム砲 装備！(14秒)'); }
+      if(pu.type === 'multi'){ multiTimer = 14; beamTimer = 0; showWarn('﹅ 3連装ショット！(14秒)'); }
+      if(pu.type === 'heal'){  healPlayer(40); showWarn('✚ HP回復 +40'); }
+      scene.remove(pu.mesh);
+      powerups.splice(i,1);
+    }
+  }
+}
+
+// ── ボスUFO母艦・ガンダム風メカのモデル（GLBあればそれ、無ければ簡易生成） ──
+function mkMothership(){
+  const g = new THREE.Group();
+  if(GLB_TEMPLATES.mothership){
+    const m = GLB_TEMPLATES.mothership.clone(true);
+    tintModel(m, 0x66ccff);
+    g.add(m);
+    g.add(new THREE.PointLight(0x66ccff, 4, 14));
+    return g;
+  }
+  const hull = new THREE.MeshPhongMaterial({color:0x44566a, shininess:90, emissive:0x0c141c});
+  const body = new THREE.Mesh(new THREE.SphereGeometry(1.5,32,16), hull); body.scale.y = 0.32; g.add(body);
+  const dome = new THREE.Mesh(new THREE.SphereGeometry(0.6,24,12,0,Math.PI*2,0,Math.PI/2),
+    new THREE.MeshPhongMaterial({color:0x2a5570, emissive:0x113a55, transparent:true, opacity:0.85}));
+  dome.position.y = 0.12; g.add(dome);
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(1.55,0.08,8,48),
+    new THREE.MeshPhongMaterial({color:0x00ccff, emissive:0x0088aa}));
+  ring.rotation.x = Math.PI/2; g.add(ring);
+  const glow = new THREE.Mesh(new THREE.SphereGeometry(0.5,16,8), new THREE.MeshBasicMaterial({color:0x00ffee}));
+  glow.position.y = -0.42; glow.scale.y = 0.4; g.add(glow);
+  for(let i=0;i<16;i++){
+    const a = i*Math.PI/8;
+    const L = new THREE.Mesh(new THREE.SphereGeometry(0.06,6,6), new THREE.MeshBasicMaterial({color:0x66ffff}));
+    L.position.set(Math.cos(a)*1.45, 0, Math.sin(a)*1.45); g.add(L);
+  }
+  g.add(new THREE.PointLight(0x66ccff, 4, 14));
+  return g;
+}
+function mkGundam(){
+  const g = new THREE.Group();
+  if(GLB_TEMPLATES.gundam){
+    g.add(GLB_TEMPLATES.gundam.clone(true));
+    return g;
+  }
+  const white = new THREE.MeshPhongMaterial({color:0xeef2f6, shininess:60});
+  const blue  = new THREE.MeshPhongMaterial({color:0x2255bb, shininess:60});
+  const red   = new THREE.MeshPhongMaterial({color:0xcc2222, shininess:60});
+  const yellow= new THREE.MeshPhongMaterial({color:0xffcc22, emissive:0x332200});
+  function leg(x){
+    const l = new THREE.Group();
+    const thigh = new THREE.Mesh(new THREE.BoxGeometry(0.07,0.16,0.07), blue); thigh.position.y = 0.12; l.add(thigh);
+    const shin  = new THREE.Mesh(new THREE.BoxGeometry(0.075,0.18,0.075), white); shin.position.y = -0.02; l.add(shin);
+    const foot  = new THREE.Mesh(new THREE.BoxGeometry(0.09,0.04,0.13), blue); foot.position.set(0,-0.12,0.02); l.add(foot);
+    l.position.set(x, 0.2, 0); return l;
+  }
+  g.add(leg(-0.06)); g.add(leg(0.06));
+  const hip = new THREE.Mesh(new THREE.BoxGeometry(0.18,0.07,0.12), red); hip.position.y = 0.34; g.add(hip);
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.22,0.16,0.13), white); torso.position.y = 0.45; g.add(torso);
+  const v1 = new THREE.Mesh(new THREE.BoxGeometry(0.05,0.06,0.02), yellow); v1.position.set(-0.05,0.46,0.07); g.add(v1);
+  const v2 = v1.clone(); v2.position.x = 0.05; g.add(v2);
+  function arm(x){
+    const a = new THREE.Group();
+    const sh = new THREE.Mesh(new THREE.BoxGeometry(0.08,0.09,0.1), red); a.add(sh);
+    const up = new THREE.Mesh(new THREE.BoxGeometry(0.06,0.14,0.06), white); up.position.y = -0.12; a.add(up);
+    const fore = new THREE.Mesh(new THREE.BoxGeometry(0.065,0.13,0.065), blue); fore.position.y = -0.26; a.add(fore);
+    a.position.set(x, 0.5, 0); return a;
+  }
+  g.add(arm(-0.16)); g.add(arm(0.16));
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.09,0.09,0.09), white); head.position.y = 0.59; g.add(head);
+  const eye = new THREE.Mesh(new THREE.BoxGeometry(0.07,0.02,0.012), new THREE.MeshBasicMaterial({color:0x00ff66})); eye.position.set(0,0.59,0.05); g.add(eye);
+  const fin = new THREE.Mesh(new THREE.BoxGeometry(0.02,0.07,0.01), yellow); fin.position.set(0,0.66,0.02); g.add(fin);
+  const rifle = new THREE.Mesh(new THREE.BoxGeometry(0.05,0.05,0.26), new THREE.MeshPhongMaterial({color:0x33373f})); rifle.position.set(0.2,0.4,0.1); g.add(rifle);
+  return g;
+}
+
+// ── ボス/メカ管理 ──
+const superEnemies = [];
+let nextBossScore = 1500;
+let gundamTimer = 20;
+
+// 地表基準に直立させ、対象（プレイヤー）方向へ向ける
+function orientToSurface(mesh, facePos){
+  const up = mesh.position.clone().normalize();
+  let fwd = facePos.clone().sub(mesh.position);
+  fwd.addScaledVector(up, -fwd.dot(up));
+  if(fwd.lengthSq() < 0.0001){
+    fwd = new THREE.Vector3(0,1,0).cross(up);
+    if(fwd.lengthSq() < 0.0001) fwd.set(1,0,0);
+  }
+  fwd.normalize();
+  const right = fwd.clone().cross(up).normalize();
+  mesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(right, up, fwd.clone().negate()));
+}
+
+function spawnBoss(){
+  const mesh = mkMothership();
+  const p = playerGroup.position;
+  const dir = getAimDir();
+  mesh.position.copy(p).addScaledVector(dir, 6).addScaledVector(p.clone().normalize(), 1.5);
+  if(mesh.position.length() < ER + 1.0) mesh.position.setLength(ER + 1.0);
+  scene.add(mesh);
+  superEnemies.push({mesh, type:'boss', hp:60, maxHp:60, radius:1.8, score:3000, speed:0.02, shootTimer:2.5, contactTimer:0});
+  showWarn('🛸 UFO母艦 出現！総攻撃を仕掛けてくる！');
+}
+
+function spawnGundam(){
+  const mesh = mkGundam();
+  const p = playerGroup.position;
+  const dir = getAimDir();
+  mesh.position.copy(p).addScaledVector(dir, 4);
+  mesh.position.setLength(ER + 0.3); // 低空（戦闘機帯）に出現
+  scene.add(mesh);
+  superEnemies.push({mesh, type:'gundam', hp:8, maxHp:8, radius:0.45, score:500, speed:0.024, shootTimer:1.5});
+  showWarn('🤖 巨大人型メカ 接近！');
+}
+
+function superFire(se, n, spread){
+  const dir0 = playerGroup.position.clone().sub(se.mesh.position).normalize();
+  const axis = se.mesh.position.clone().normalize();
+  for(let k = 0; k < n; k++){
+    const off = (n === 1) ? 0 : (k/(n-1) - 0.5) * spread;
+    const dir = dir0.clone().applyAxisAngle(axis, off);
+    dir.x += (Math.random()-0.5)*0.04; dir.y += (Math.random()-0.5)*0.04;
+    dir.normalize();
+    const b = new THREE.Mesh(bulletGeo, enemyBulletMat);
+    b.position.copy(se.mesh.position);
+    scene.add(b);
+    eBullets.push({mesh:b, vel:dir.multiplyScalar(1.4), life:5});
+  }
+}
+
+function updateSuperEnemies(dt){
+  // スポーン制御
+  if(playerHP > 0 && gameScore >= nextBossScore && !superEnemies.some(s => s.type === 'boss')){
+    spawnBoss();
+    nextBossScore += 4000;
+  }
+  gundamTimer -= dt;
+  if(playerHP > 0 && gundamTimer <= 0 && superEnemies.filter(s => s.type === 'gundam').length < 2){
+    spawnGundam();
+    gundamTimer = 22 + Math.random()*14;
+  }
+
+  const pPos = playerGroup.position;
+  for(let i = superEnemies.length-1; i >= 0; i--){
+    const se = superEnemies[i];
+    const toP = pPos.clone().sub(se.mesh.position);
+    const dist = toP.length();
+
+    if(se.type === 'boss'){
+      // 母艦：3Dでプレイヤーを追うが一定距離を保つ。高高度も追える。
+      if(dist > 3.2) se.mesh.position.addScaledVector(toP.clone().normalize(), se.speed);
+      if(se.mesh.position.length() < ER + 1.0) se.mesh.position.setLength(ER + 1.0);
+      orientToSurface(se.mesh, pPos);
+      se.mesh.rotation.y += 0.004;
+      se.shootTimer -= dt;
+      if(se.shootTimer <= 0 && dist < 10){ superFire(se, 7, 0.9); se.shootTimer = 2.2; }
+      se.contactTimer -= dt;
+      if(dist < se.radius && se.contactTimer <= 0){ damage(8); se.contactTimer = 1; }
+    } else {
+      // ガンダム：低空維持でプレイヤーを追い、こちらを向いて射撃
+      const FMAX = 0.35;
+      let target = pPos.clone();
+      if(pPos.length() - ER > FMAX) target = pPos.clone().normalize().multiplyScalar(ER + FMAX);
+      const t2 = target.sub(se.mesh.position);
+      se.mesh.position.addScaledVector(t2.normalize(), se.speed);
+      if(se.mesh.position.length() - ER > FMAX) se.mesh.position.setLength(ER + FMAX);
+      if(se.mesh.position.length() < ER + 0.15) se.mesh.position.setLength(ER + 0.15);
+      orientToSurface(se.mesh, pPos);
+      se.shootTimer -= dt;
+      if(se.shootTimer <= 0 && dist < 7){ superFire(se, 2, 0.25); se.shootTimer = 1.6 + Math.random(); }
+    }
+
+    // プレイヤー弾との当たり判定
+    for(let j = bullets.length-1; j >= 0; j--){
+      const b = bullets[j];
+      if(b.mesh.position.distanceTo(se.mesh.position) < se.radius){
+        se.hp -= b.dmg;
+        scene.remove(b.mesh); bullets.splice(j,1);
+        if(se.hp <= 0){
+          explode(se.mesh.position.clone(), se.type === 'boss' ? 6 : 2, se.type === 'boss' ? 0x66ccff : 0xffaa33);
+          scene.remove(se.mesh);
+          if(currentTarget === se) currentTarget = null;
+          addScore(se.score);
+          showWarn(se.type === 'boss' ? '🛸 UFO母艦 撃破！+' + se.score : '🤖 メカ撃破！+' + se.score);
+          superEnemies.splice(i,1);
+          break;
+        } else {
+          explode(b.mesh.position.clone(), 0.7, 0xffdd66);
+        }
+      }
+    }
+  }
+
+  // ボスHPバー表示更新
+  const boss = superEnemies.find(s => s.type === 'boss');
+  if(boss){
+    bossBar.style.display = 'block';
+    bossFill.style.width = Math.max(0, boss.hp / boss.maxHp * 100) + '%';
+  } else {
+    bossBar.style.display = 'none';
+  }
+}
+
+// ── HUD更新 ──
+function updateExtraHud(){
+  const parts = [];
+  if(beamTimer > 0)  parts.push('⚡ビーム ' + beamTimer.toFixed(1) + 's');
+  if(multiTimer > 0) parts.push('﹅3連装 ' + multiTimer.toFixed(1) + 's');
+  puHud.textContent = parts.join('　');
+}
+
+// update() から毎フレーム呼ぶ集約関数
+function updateExtras(dt){
+  if(beamTimer > 0)  beamTimer  = Math.max(0, beamTimer - dt);
+  if(multiTimer > 0) multiTimer = Math.max(0, multiTimer - dt);
+  updatePowerups(dt);
+  updateSuperEnemies(dt);
+  updateExtraHud();
 }
 
 function update(dt){
@@ -1292,6 +1633,8 @@ function update(dt){
       b.mesh.userData.light.material.emissive = new THREE.Color(b.color).multiplyScalar(0.5 + Math.sin(t)*0.5);
     }
   });
+
+  updateExtras(dt);
 }
 
 // ── メインループ ────────────────────────
