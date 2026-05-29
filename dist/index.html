@@ -828,6 +828,13 @@ GAME.refs = {
   aimDir(){ return getAimDir(); },
 };
 
+// 発射拡張フック（2号機の武器強化用）：ハンドラが true を返すと既定の発射をスキップ
+const _fireHandlers = [];
+GAME.onFire = fn => { if(typeof fn === 'function') _fireHandlers.push(fn); };
+// 被ダメージ修飾フック（2号機のシールド等）：fn(n) => 修正後n（0以下なら無効化＝被弾なし）
+const _damageMods = [];
+GAME.onDamage = fn => { if(typeof fn === 'function') _damageMods.push(fn); };
+
 // ── Blender製GLBモデルの読み込み・差し替え ───────────────
 // window.GLB_DATA[key] = base64(GLB)。未提供キーは従来のプロシージャル描画に自動フォールバック。
 const GLB_TEMPLATES = {};
@@ -1132,6 +1139,9 @@ function addScore(n){
 }
 
 function damage(n){
+  // 2号機の被ダメージ修飾（シールド等）。0以下になれば無効化
+  for(let i = 0; i < _damageMods.length; i++){ try { n = _damageMods[i](n); } catch(e){ console.warn('damage mod', e); } }
+  if(n <= 0) return;
   GAME.emit('playerHit', {n});
   playerHP -= n;
   if(playerHP < 0) playerHP = 0;
@@ -1428,6 +1438,8 @@ const _origPlayerFire = playerFire;
 playerFire = function(){
   if(playerHP <= 0) return;
   GAME.emit('playerFire');
+  // 2号機の発射拡張（散弾/貫通レーザー/メガビーム等）。true を返したら既定発射はスキップ
+  for(let i = 0; i < _fireHandlers.length; i++){ try { if(_fireHandlers[i]()) return; } catch(e){ console.warn('fire handler', e); } }
   if(beamTimer > 0){ fireBeam(); return; }
   if(multiTimer > 0){ fireMulti(); return; }
   _origPlayerFire();
