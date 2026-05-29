@@ -40,5 +40,13 @@ out = os.path.join(DIST, "index.html")
 with open(out, "w", encoding="utf-8") as f:
     f.write(html)
 
+# GitHub Pages 公開用（master /docs から配信）にも同じ内容を出力
+DOCS = os.path.join(ROOT, "docs")
+os.makedirs(DOCS, exist_ok=True)
+docs_out = os.path.join(DOCS, "index.html")
+with open(docs_out, "w", encoding="utf-8") as f:
+    f.write(html)
+
 print("埋め込んだモデル:", list(data.keys()))
 print("出力:", out, "(%.1f KB)" % (os.path.getsize(out) / 1024.0))
+print("公開用:", docs_out)
