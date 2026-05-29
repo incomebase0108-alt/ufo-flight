@@ -1186,8 +1186,9 @@ function orientToSurface(mesh, facePos){
     if(fwd.lengthSq() < 0.0001) fwd.set(1,0,0);
   }
   fwd.normalize();
-  const right = fwd.clone().cross(up).normalize();
-  mesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(right, up, fwd.clone().negate()));
+  // モデルの正面(+Z, glTF)を対象へ向け、上(+Y)を地表法線に合わせる
+  const right = up.clone().cross(fwd).normalize();
+  mesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(right, up, fwd));
 }
 
 function spawnBoss(){
