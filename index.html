@@ -798,9 +798,8 @@ function enemyFire(enemy){
   dir.y += (Math.random() - 0.5) * 0.1;
   dir.z += (Math.random() - 0.5) * 0.1;
   dir.normalize();
-  const b = new THREE.Mesh(bulletGeo, enemyBulletMat);
+  const b = acquireEBullet();
   b.position.copy(enemy.mesh.position);
-  scene.add(b);
   eBullets.push({mesh: b, vel: dir.multiplyScalar(1.2), life: 4});
 }
 
@@ -1130,6 +1129,20 @@ for(let _i = 0; _i < MAX_BULLETS; _i++){
   _m.visible = false; scene.add(_m); _pBulletPool.push(_m);
 }
 
+// ── 敵弾オブジェクトプール（phase2-step2）。全敵弾は bulletGeo+enemyBulletMat 共有 ──
+const _eBulletPool = [];
+function acquireEBullet(){
+  let m = _eBulletPool.pop();
+  if(!m){ m = new THREE.Mesh(bulletGeo, enemyBulletMat); scene.add(m); }
+  m.visible = true;
+  return m;
+}
+function releaseEBullet(m){ m.visible = false; _eBulletPool.push(m); }
+for(let _i = 0; _i < MAX_EBULLETS; _i++){
+  const _m = new THREE.Mesh(bulletGeo, enemyBulletMat);
+  _m.visible = false; scene.add(_m); _eBulletPool.push(_m);
+}
+
 function fireBeam(){
   const p = playerGroup.position;
   const dir = getAimDir();
@@ -1356,9 +1369,8 @@ function superFire(se, n, spread){
     const dir = dir0.clone().applyAxisAngle(axis, off);
     dir.x += (Math.random()-0.5)*0.04; dir.y += (Math.random()-0.5)*0.04;
     dir.normalize();
-    const b = new THREE.Mesh(bulletGeo, enemyBulletMat);
+    const b = acquireEBullet();
     b.position.copy(se.mesh.position);
-    scene.add(b);
     eBullets.push({mesh:b, vel:dir.multiplyScalar(1.4), life:5});
   }
 }
@@ -1850,14 +1862,14 @@ function update(dt){
     b.mesh.position.add(b.vel.clone().multiplyScalar(dt * 60));
     b.life -= dt;
     if(b.life <= 0){
-      scene.remove(b.mesh);
+      releaseEBullet(b.mesh);
       eBullets.splice(i, 1);
       continue;
     }
     // プレイヤーに命中
     if(b.mesh.position.distanceTo(playerGroup.position) < 0.4){
       damage(10);
-      scene.remove(b.mesh);
+      releaseEBullet(b.mesh);
       eBullets.splice(i, 1);
     }
   }
