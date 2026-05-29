@@ -58,11 +58,19 @@
     megaBeams: 24, megaDamage: 6, megaCooldown: 15, megaBeamLife: 2.0, megaSpeed: 3.2, megaBeamRadius: 0.05,
     // ドロップ（敵種別の出現率／種類の重み）
     dropChance:  { fighter:0.22, mecha:0.5, ship:0.6, tank:0.28, base:0.85, boss:1.0 },
-    dropWeights: { heal:40, ammo:30, invinc:15, score2x:8, bomb:7 },
+    dropWeights: { heal:36, ammo:26, invinc:13, score2x:8, bomb:7, speed:10 },
     maxItems: 6, itemLife: 18, pickupRadius: 0.6,
     // アイテム効果
     healAmount: 30, overchargeDuration: 8, invincDuration: 6, score2xDuration: 12,
-    bombBeams: 28, bombDamage: 5,   // 全画面ボム（即時の放射斉射）
+    bombBeams: 28, bombDamage: 5,           // 全画面ボム（即時の放射斉射）
+    speedMul: 1.6, speedDuration: 8,        // スピードアップ（1号機 GAME.setSpeedMultiplier 連携）
+    // ② 効果減衰：時限バフは被弾1ヒットで -buffHitPenalty 秒（永続アンロックは対象外）
+    buffHitPenalty: 2,
+    // ① 自機装飾（GAME.refs.playerGroup へ重ねる装飾レイヤー）
+    deco: {
+      ringColor:0x66ccff, shieldColor:0x3388ff, podColor:0xff66cc, emitterColor:0x66ffff, auraColor:0xff66ff,
+      ringRadius:0.30, shieldRadius:0.42, podOffset:0.26, podSize:0.07, emitterFwd:0.30, auraRadius:0.60, megaScale:1.18,
+    },
   };
   var PRESETS = {
     easy: {
@@ -110,17 +118,20 @@
     invinc:  { color:0x9fe8ff, icon:'★', label:'一時無敵',     shape:'rainbow' },
     score2x: { color:0xffd54a, icon:'×2', label:'スコア2倍',   shape:'star' },
     bomb:    { color:0xff5522, icon:'✸', label:'全画面ボム',   shape:'spike' },
+    speed:   { color:0x66ff99, icon:'»', label:'スピードアップ', shape:'arrow' },
   };
 
   // ── 内部状態 ───────────────────────────────────────────────
   var S = {
     rapid:false, shield:false, spread:false, pierce:false, mega:false,
     shieldMax:CONFIG.shieldMax, shieldHp:0, sinceHit:99,
-    overcharge:0, invinc:0, score2x:0,
-    megaCharge:0,
+    overcharge:0, invinc:0, score2x:0, speed:0,   // 時限バフ残り秒
+    megaCharge:0, _speedApplied:1,
     // score2x（外部増分のみ2倍にする・フィードバックループ防止）
     _lastExternal:null, _bonusTotal:0,
   };
+  // ① 自機装飾レイヤー
+  var deco = { group:null, mount:null, ring:null, shield:null, pods:false, emitter:null, aura:null, invincShell:null, shieldFlash:0 };
   var items = [];     // ドロップ中アイテム
   var trails = [];    // ②トレイルの残像（上限管理）
   var TRAIL_CAP = 70;
@@ -150,6 +161,7 @@
     if (S.overcharge > 0) lines.push('▣ 弾薬チャージ ' + S.overcharge.toFixed(1) + 's');
     if (S.invinc > 0)     lines.push('★ 無敵 ' + S.invinc.toFixed(1) + 's');
     if (S.score2x > 0)    lines.push('×2 スコア2倍 ' + S.score2x.toFixed(1) + 's');
+    if (S.speed > 0)      lines.push('» スピードUP ' + S.speed.toFixed(1) + 's');
     if (S.mega) lines.push('💥 メガビーム ' + (S.megaCharge >= CONFIG.megaCooldown ? 'READY' : Math.ceil(CONFIG.megaCooldown - S.megaCharge) + 's'));
     lines.push('〔preset: ' + CONFIG.preset + '〕');
     hud.innerHTML = lines.join('<br>');
@@ -223,11 +235,19 @@
   }
 
   // ════════════════════════════════════════════════════════════════════
-  //  被ダメージ修飾（GAME.onDamage）：無敵→シールド→残りHP
+  //  被ダメージ修飾（GAME.onDamage）：② 時限バフ減衰 → 無敵 → シールド → 残りHP
   // ════════════════════════════════════════════════════════════════════
   function onDamage(n){
     S.sinceHit = 0;
-    if (S.invinc > 0) return 0;
+    var wasInvinc = S.invinc > 0;
+    // ② 時限バフは被弾ごと短縮（永続アンロック rapid/spread/pierce/mega は対象外＝買い切り）
+    var pen = CONFIG.buffHitPenalty;
+    if (S.invinc > 0)     S.invinc     = Math.max(0, S.invinc - pen);
+    if (S.score2x > 0)    S.score2x    = Math.max(0, S.score2x - pen);
+    if (S.overcharge > 0) S.overcharge = Math.max(0, S.overcharge - pen);
+    if (S.speed > 0)      S.speed      = Math.max(0, S.speed - pen);
+    deco.shieldFlash = 0.25;                 // ① 被弾フラッシュ
+    if (wasInvinc) return 0;                 // 被弾時に無敵だった → このヒットはカット
     if (S.shield && S.shieldHp > 0){
       if (S.shieldHp >= n){ S.shieldHp -= n; refreshHud(); return 0; }
       var rem = n - S.shieldHp; S.shieldHp = 0; refreshHud(); return rem;
@@ -296,6 +316,7 @@
     if (shape === 'box')    return new T.Mesh(new T.BoxGeometry(0.12, 0.12, 0.12), m);            // 弾薬
     if (shape === 'star')   return new T.Mesh(new T.TorusKnotGeometry(0.06, 0.022, 48, 6), m);    // スコア2倍
     if (shape === 'spike')  return new T.Mesh(new T.OctahedronGeometry(0.1, 0), m);               // ボム
+    if (shape === 'arrow')  return new T.Mesh(new T.ConeGeometry(0.07, 0.16, 12), m);             // スピードアップ
     return new T.Mesh(new T.IcosahedronGeometry(0.09, 0), m);                                     // 無敵ほか
   }
   function spawnDrop(pos, chance){
@@ -318,9 +339,83 @@
     else if (key === 'invinc') S.invinc = CONFIG.invincDuration;
     else if (key === 'score2x'){ S.score2x = CONFIG.score2xDuration; }
     else if (key === 'bomb')   bombDischarge();
+    else if (key === 'speed')  S.speed = CONFIG.speedDuration;   // 1号機 setSpeedMultiplier は update で適用
     warn(DROPS[key].icon + ' ' + DROPS[key].label);
     GAME.emit('itemGet', { type:key });   // ★ 4号機 sfx.item() 発火（③配線）
     refreshHud();
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  ① 自機の見た目強化：装飾レイヤーを playerGroup（or GAME.playerMesh）へ重ねる
+  //     core（UFOメッシュ生成）は無改変。アンロック段階で add、毎フレーム同期。
+  // ════════════════════════════════════════════════════════════════════
+  var _dA = {};   // 装飾アセット（lazy）
+  function decoAssets(){
+    var D = CONFIG.deco;
+    _dA.ring     = _dA.ring     || new T.Mesh(new T.TorusGeometry(D.ringRadius, 0.018, 8, 24), new T.MeshBasicMaterial({ color:D.ringColor }));
+    _dA.shieldMt = _dA.shieldMt || new T.MeshBasicMaterial({ color:D.shieldColor, transparent:true, opacity:0.25 });
+    _dA.auraMt   = _dA.auraMt   || new T.MeshBasicMaterial({ color:D.auraColor, transparent:true, opacity:0.18 });
+    return _dA;
+  }
+  function ensureMount(){
+    if (deco.group) return true;
+    var pm = (typeof GAME.playerMesh !== 'undefined' && GAME.playerMesh) ? GAME.playerMesh : GAME.refs.playerGroup;
+    if (!pm || typeof pm.add !== 'function') return false;
+    deco.group = new T.Group();
+    deco.mount = pm;
+    pm.add(deco.group);
+    return true;
+  }
+  function syncDeco(dt){
+    if (!ensureMount()) return;
+    var D = CONFIG.deco;
+    // ⚡ 連射2倍：発光リング高速回転
+    if (S.rapid){
+      if (!deco.ring){ decoAssets(); deco.ring = _dA.ring; deco.ring.rotation.x = Math.PI/2; deco.group.add(deco.ring); }
+      deco.ring.rotation.z += (S.overcharge > 0 ? 0.45 : 0.28);
+    }
+    // 🛡 シールド：半透明シールド球（残量で色/透明度、被弾でフラッシュ）
+    if (S.shield){
+      if (!deco.shield){ decoAssets(); deco.shield = new T.Mesh(new T.SphereGeometry(D.shieldRadius, 16, 12), _dA.shieldMt.clone()); deco.group.add(deco.shield); }
+      var r = S.shieldMax ? (S.shieldHp / S.shieldMax) : 0;        // 満タン=1
+      deco.shield.material.color.setHSL(0.6 * r, 1, 0.5);          // 濃青(0.6)→赤(0)
+      var op = 0.10 + 0.28 * r;
+      if (deco.shieldFlash > 0){ deco.shieldFlash = Math.max(0, deco.shieldFlash - dt); op = 0.55; }
+      deco.shield.material.opacity = op;
+      deco.shield.visible = S.shieldHp > 0.5 || deco.shieldFlash > 0;
+    }
+    // ﹅ 散弾：サイドポッド2基
+    if (S.spread && !deco.pods){
+      decoAssets();
+      var pm2 = new T.MeshBasicMaterial({ color:D.podColor });
+      for (var s = -1; s <= 1; s += 2){
+        var pod = new T.Mesh(new T.SphereGeometry(D.podSize, 10, 8), pm2);
+        pod.position.set(s * D.podOffset, 0, 0);
+        deco.group.add(pod);
+      }
+      deco.pods = true;
+    }
+    // 🔆 レーザー貫通：機首発光エミッター
+    if (S.pierce && !deco.emitter){
+      deco.emitter = new T.Mesh(new T.SphereGeometry(0.05, 10, 8), new T.MeshBasicMaterial({ color:D.emitterColor }));
+      deco.emitter.position.set(0, 0, -D.emitterFwd);   // 機首方向（-Z 前方想定）
+      deco.group.add(deco.emitter);
+      deco.group.add(new T.PointLight(D.emitterColor, 0.8, 1.0));
+    }
+    // 💥 メガビーム：オーラ＋装飾拡大＋色変化（最終形態感）。core scale は触らない
+    if (S.mega){
+      if (!deco.aura){ decoAssets(); deco.aura = new T.Mesh(new T.SphereGeometry(D.auraRadius, 16, 12), _dA.auraMt.clone()); deco.group.add(deco.aura); }
+      deco.auraHue = ((deco.auraHue || 0) + dt * 0.4) % 1;
+      deco.aura.material.color.setHSL(deco.auraHue, 1, 0.6);
+      deco.aura.rotation.y += 0.01;
+      deco.group.scale.setScalar(D.megaScale);
+    }
+    // ★ 一時無敵：金色シェル（時限。切れたら消えて見た目が戻る＝②）
+    if (S.invinc > 0){
+      if (!deco.invincShell){ deco.invincShell = new T.Mesh(new T.SphereGeometry(D.shieldRadius * 1.1, 14, 10), new T.MeshBasicMaterial({ color:0xffdd55, transparent:true, opacity:0.22 })); deco.group.add(deco.invincShell); }
+      deco.invincShell.visible = true;
+      deco.invincShell.rotation.y += 0.08;
+    } else if (deco.invincShell){ deco.invincShell.visible = false; }
   }
 
   // ── ②トレイル：貫通/メガ弾の残像を生成・減衰 ───────────────
@@ -353,7 +448,14 @@
     if (S.overcharge > 0) S.overcharge = Math.max(0, S.overcharge - dt);
     if (S.invinc > 0)     S.invinc     = Math.max(0, S.invinc - dt);
     if (S.score2x > 0)    S.score2x    = Math.max(0, S.score2x - dt);
+    if (S.speed > 0)      S.speed      = Math.max(0, S.speed - dt);
     S.sinceHit += dt;
+
+    // スピードアップ：1号機 GAME.setSpeedMultiplier に倍率を反映（変化時のみ）
+    var wantMul = S.speed > 0 ? CONFIG.speedMul : 1;
+    if (wantMul !== S._speedApplied && typeof GAME.setSpeedMultiplier === 'function'){
+      GAME.setSpeedMultiplier(wantMul); S._speedApplied = wantMul;
+    }
 
     // スコア2倍：外部増分だけを追い足し（自分の加点はループしないよう除外）
     var cur = GAME.refs.score | 0;
@@ -376,6 +478,7 @@
     if (flashTime > 0 && flashEl){ flashTime = Math.max(0, flashTime - dt); flashEl.style.opacity = (flashTime / 0.32 * 0.6).toFixed(3); }
 
     updateTrails(dt);
+    syncDeco(dt);   // ① 自機装飾レイヤーを状態に同期
 
     // ドロップアイテム：アニメ・寿命・取得
     var pg = GAME.refs.playerGroup, scene = GAME.refs.scene;
@@ -416,7 +519,7 @@
   window.UFOUpgrades = {
     setPreset: function(name){ applyPreset(name); refreshHud(); warn('⚙ preset: ' + CONFIG.preset); return CONFIG.preset; },
     getConfig: function(){ return CONFIG; },
-    _state:S, _items:items, onFire:onFire, onDamage:onDamage, update:update,
+    _state:S, _items:items, _deco:deco, onFire:onFire, onDamage:onDamage, update:update,
   };
   console.log('[UFOUpgrades] 2号機 UFO強化＆ドロップアイテム 接続完了（preset=' + CONFIG.preset + '）');
 })();
