@@ -358,6 +358,180 @@
   }
 
   // ════════════════════════════════════════════════════════════
+  //  環境演出：雷雲 / オーロラ / 流星群（hoshi要望・GAMEバス接続・index.html無改変）
+  //  いずれも「飛ぶプレイヤー視点の環境」。地表固定不要。雷雲のみ当たり判定（突入で視界悪化）。
+  // ════════════════════════════════════════════════════════════
+  var envT = 0;                                  // 経過時間アキュムレータ（Date.now 非依存）
+
+  // ── 視界悪化用 DOM オーバーレイ（動的生成・index.html 無改変） ──
+  var visOverlay = null, visLevel = 0;
+  function ensureOverlay() {
+    if (visOverlay || typeof document === 'undefined' || !document.body) return;
+    visOverlay = document.createElement('div');
+    visOverlay.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:40;background:#0a0f1e;opacity:0;';
+    document.body.appendChild(visOverlay);
+  }
+
+  // ── 1. 雷雲（暗い雲ボリューム＋稲妻＋突入で視界悪化） ──
+  var clouds = [];
+  var CLOUD_R = 1.6;                             // 突入判定半径
+  function mkCloud() {
+    var g = new THREE.Group();
+    var puffMat = new THREE.MeshPhongMaterial({ color: 0x2a2f3a, emissive: 0x05070c, transparent: true, opacity: 0.85, flatShading: true });
+    for (var i = 0; i < 7; i++) {
+      var s = new THREE.Mesh(new THREE.SphereGeometry(0.5 + Math.random() * 0.5, 8, 6), puffMat);
+      s.position.set((Math.random() - 0.5) * 2.2, (Math.random() - 0.5) * 0.7, (Math.random() - 0.5) * 2.2);
+      s.scale.y = 0.6;
+      g.add(s);
+    }
+    var flash = new THREE.PointLight(0xaaccff, 0, 6);   // 稲妻（通常消灯）
+    g.add(flash);
+    g.userData.flash = flash;
+    g.userData.flashT = 2 + Math.random() * 4;
+    return g;
+  }
+  function initClouds() {
+    for (var i = 0; i < 4; i++) {                // 低〜中空に4カ所（固定ワールド座標）
+      var c = mkCloud();
+      var dir = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
+      c.position.copy(dir.multiplyScalar(ER + 0.6 + Math.random() * 2.0));
+      R.scene.add(c);
+      clouds.push(c);
+    }
+  }
+  function updateClouds(dt) {
+    var player = R.playerGroup.position;
+    var inside = false, nearFlash = 0;
+    for (var i = 0; i < clouds.length; i++) {
+      var c = clouds[i];
+      c.rotation.y += dt * 0.05;
+      var f = c.userData.flash;
+      c.userData.flashT -= dt;
+      if (c.userData.flashT <= 0) {
+        f.intensity = 6;                         // 一瞬光る
+        c.userData.flashT = 2 + Math.random() * 5;
+        GAME.emit('thunder', { pos: c.position.clone() });  // 4号機が sfx 配線できるよう（未配線でも無害）
+      } else {
+        f.intensity *= Math.max(0, 1 - dt * 8);  // 減衰
+      }
+      var d = player.distanceTo(c.position);
+      if (d < CLOUD_R) inside = true;
+      if (d < CLOUD_R * 2) nearFlash = Math.max(nearFlash, (f.intensity / 6) * (1 - d / (CLOUD_R * 2)));
+    }
+    // 視界オーバーレイ：雲内で暗化、近接稲妻で一瞬白フラッシュ（一時的・回復型）
+    ensureOverlay();
+    if (visOverlay) {
+      var target = inside ? 0.6 : 0;
+      visLevel += (target - visLevel) * Math.min(1, dt * 4);     // なめらかに追従
+      if (inside && nearFlash > 0.2) {
+        visOverlay.style.background = '#cfe0ff';
+        visOverlay.style.opacity = String(Math.min(0.75, visLevel + nearFlash * 0.5));
+      } else {
+        visOverlay.style.background = '#0a0f1e';
+        visOverlay.style.opacity = String(visLevel);
+      }
+    }
+  }
+
+  // ── 2. オーロラ（極地上空・緑〜紫の波打つカーテン） ──
+  var auroras = [];
+  function mkAurora(poleSign) {
+    // 極軸まわりの開いた円筒をカーテンに見立て、頂点カラーで緑(下)→紫(上)、加算半透明
+    var geo = new THREE.CylinderGeometry(2.6, 2.6, 2.4, 40, 6, true);
+    var pos = geo.attributes.position, colors = [];
+    for (var i = 0; i < pos.count; i++) {
+      var t = (pos.getY(i) + 1.2) / 2.4;         // 0(下)→1(上)
+      colors.push(0.15 + t * 0.55, 1.0 - t * 0.7, 0.3 + t * 0.65);   // 緑→紫
+    }
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    var mat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.0, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false });
+    var m = new THREE.Mesh(geo, mat);
+    m.position.set(0, poleSign * (ER + 1.8), 0);
+    R.scene.add(m);
+    return { mesh: m, base: geo.attributes.position.array.slice(0), sign: poleSign };
+  }
+  function initAurora() { auroras.push(mkAurora(1)); auroras.push(mkAurora(-1)); }
+  function updateAurora(dt) {
+    var player = R.playerGroup.position;
+    for (var k = 0; k < auroras.length; k++) {
+      var a = auroras[k];
+      a.mesh.rotation.y += dt * 0.08;
+      // 波打ち：半径方向に sin で揺らす
+      var p = a.mesh.geometry.attributes.position, base = a.base;
+      for (var i = 0; i < p.count; i++) {
+        var bx = base[i * 3], by = base[i * 3 + 1], bz = base[i * 3 + 2];
+        var ang = Math.atan2(bz, bx);
+        var w = 1 + 0.12 * Math.sin(ang * 5 + envT * 1.5 + by);
+        p.setX(i, bx * w); p.setZ(i, bz * w);
+      }
+      p.needsUpdate = true;
+      // 極に近いほど濃く（極地を飛ぶと見える）
+      var poleY = a.sign * (ER + 1.8);
+      var distToPole = Math.abs(player.y - poleY) + Math.hypot(player.x, player.z) * 0.5;
+      var vis = clamp(1 - distToPole / 6, 0, 1);
+      a.mesh.material.opacity = vis * (0.35 + 0.15 * Math.sin(envT * 2));   // ゆらぎ
+      a.mesh.visible = vis > 0.02;
+    }
+  }
+
+  // ── 3. 流星群（高高度/宇宙寄りで斜めに走る・当たり判定なし） ──
+  var meteors = [];
+  var meteorTimer = 2;
+  function spawnMeteor() {
+    var cam = R.camera;
+    var fwd = new THREE.Vector3(); cam.getWorldDirection(fwd);
+    var origin = cam.position.clone().addScaledVector(fwd, 30)
+      .add(new THREE.Vector3((Math.random() - 0.5) * 50, (Math.random() - 0.5) * 50, (Math.random() - 0.5) * 50));
+    var vel = new THREE.Vector3(Math.random() - 0.5, -(0.5 + Math.random()), Math.random() - 0.5).normalize().multiplyScalar(18 + Math.random() * 22);
+    var head = new THREE.Mesh(new THREE.SphereGeometry(0.06, 6, 6), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+    head.position.copy(origin);
+    var trail = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([origin.clone(), origin.clone()]),
+      new THREE.LineBasicMaterial({ color: 0x99bbff, transparent: true, opacity: 0.85 })
+    );
+    R.scene.add(head); R.scene.add(trail);
+    meteors.push({ head: head, trail: trail, vel: vel, life: 1.6 });
+  }
+  function updateMeteors(dt) {
+    var playerAlt = R.playerGroup.position.length() - ER;
+    meteorTimer -= dt;
+    if (playerAlt > 2 && meteorTimer <= 0 && meteors.length < 6) {   // 高高度/宇宙寄りでのみ
+      spawnMeteor();
+      meteorTimer = 0.4 + Math.random() * 1.2;
+    }
+    for (var i = meteors.length - 1; i >= 0; i--) {
+      var m = meteors[i];
+      m.life -= dt;
+      var prev = m.head.position.clone();
+      m.head.position.addScaledVector(m.vel, dt);
+      // トレイル（頭の後方へ伸ばす）
+      var tail = m.head.position.clone().addScaledVector(m.vel, -0.12);
+      var arr = m.trail.geometry.attributes.position;
+      arr.setXYZ(0, tail.x, tail.y, tail.z); arr.setXYZ(1, m.head.position.x, m.head.position.y, m.head.position.z);
+      arr.needsUpdate = true;
+      var op = Math.max(0, m.life / 1.6);
+      m.head.material.opacity = op; m.head.material.transparent = true;
+      m.trail.material.opacity = op * 0.85;
+      if (m.life <= 0) {
+        R.scene.remove(m.head); R.scene.remove(m.trail);
+        m.head.geometry.dispose(); m.trail.geometry.dispose();
+        meteors.splice(i, 1);
+      }
+    }
+  }
+
+  function updateEnv(dt) {
+    envT += dt;
+    updateClouds(dt);
+    updateAurora(dt);
+    updateMeteors(dt);
+  }
+
+  // 初期化（scene は GAME 定義後に存在）
+  initClouds();
+  initAurora();
+
+  // ════════════════════════════════════════════════════════════
   //  毎フレーム集約（1本の onUpdate に集約）
   // ════════════════════════════════════════════════════════════
   GAME.onUpdate(function (dt) {
@@ -366,8 +540,9 @@
     updateMissiles(dt);    // 新敵：誘導ミサイル
     updateSmoke(dt);       // 煙
     updateFx(dt);          // 爆発上乗せ演出
+    updateEnv(dt);         // 環境演出：雷雲・オーロラ・流星群
     applyShake(dt);        // 被弾シェイク（updateCamera の後・render の前）
   });
 
-  console.log('[3号機] FX/新敵モジュール 読込完了（誘導ミサイル・爆発強化・画面シェイク・戦闘機AI修正）');
+  console.log('[3号機] FX/新敵/環境モジュール 読込完了（ミサイル・爆発・シェイク・戦闘機AI・戦車陸地拘束・雷雲/オーロラ/流星群）');
 })();
